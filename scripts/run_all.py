@@ -3,7 +3,6 @@
 """
 TelBattle â€” ط§ط¬ط±ط§غŒ ظ‡ظ…ط²ظ…ط§ظ† ط±ط¨ط§طھ طھظ„ع¯ط±ط§ظ… + Mini App API
 """
-
 import threading
 import logging
 import sys
