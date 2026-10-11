@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Shop, Skins, Missions, Mining Handlers
+"""
+
+import json
+import os
+import logging
+import random
+import uuid
+from html import escape
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+
+import telegram
+import telegram.error
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, WebAppInfo
+from telegram.ext import Application, ContextTypes
+
+from game_core import DatabaseManager, GameLogic, CardManager, StatType, Card, CardRarity, Player, PvPFight, FightStatus
+from systems.fusion_system import FusionSystem
+from systems.phase2_systems import LevelSystem, TierSystem, format_xp_bar, format_tier_badge
+from systems.economy_system import EconomySystem
+from systems.card_upgrade_system import CardUpgradeSystem
+from systems.tier_decay_system import TierDecaySystem
+from systems.risk_mode_system import RiskModeSystem, RiskTable, RiskAction
+from systems.battle_system_3rounds import BattleSystem3Rounds, BattleState, ARENAS
+from systems.card_missions_system import CardMissionsSystem, MISSION_TYPES
+from systems.skins_system import SkinsSystem, SKIN_TYPES
+
+logger = logging.getLogger(__name__)
+
+from bot.utils import (check_user_started_bot, handle_user_not_started, ensure_text_content,
+    get_card_image_path, get_victory_dialog, send_card_image_safely, ensure_not_expired,
+    REQUIRED_CHANNEL, PANEL_TIMEOUT)
+
+
+
+
+class ShopHandlersMixin:
+    """Shop, Skins, Missions, Mining Handlers"""
+
+    async def skins_menu_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """منوی اسکین‌های یک کارت"""
+        query = update.callback_query
+        await query.answer()
+        # skins_menu_{card_id}
+        card_id = query.data.split("_", 2)[2]
+        await self._show_skins_menu(query, card_id)
+
+    async def _show_skins_menu(self, query, card_id: str):
+        user_id = query.from_user.id
+        card = self.db.get_card_by_id_for_player(card_id, user_id) or self.db.get_card_by_id(card_id)
+        if not card:
+            await query.answer("❌ کارت یافت نشد!", show_alert=True)
+            return
+
+        player = self.db.get_or_create_player(user_id)
+        coins = getattr(player, 'coins', 0)
+
+        # اسکین‌های موجود برای این کارت
+        all_skins = self.skins.get_card_skins(card_id)
+        player_skins = {s['skin_id'] for s in self.skins.get_player_skins(user_id, card_id)}
+        active_skin = self.skins.get_active_skin(user_id, card_id)
+
+        if not all_skins:
+            text = (
+                f"🎨 <b>اسکین‌های {escape(card.name)}</b>\n\n"
+                f"هنوز هیچ اسکینی برای این کارت موجود نیست."
+            )
+            keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"cardinfo_{card_id}")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            return
+
+        type_emoji = {"normal": "🎨", "special": "✨", "seasonal": "🌸", "event": "🎁", "premium": "💎"}
+        text = (
+            f"🎨 <b>اسکین‌های {escape(card.name)}</b>\n\n"
+            f"💰 موجودی: {coins:,} سکه\n\n"
+        )
+
+        keyboard = []
+        for skin in all_skins:
+            owned = skin['skin_id'] in player_skins
+            is_active = skin['skin_id'] == active_skin
+            emoji = type_emoji.get(skin['skin_type'], "🎨")
+            status = "✅ فعال" if is_active else ("🔓 دارم" if owned else f"🔒 {skin['price']} سکه")
+            btn_text = f"{emoji} {skin['name']} — {status}"
+
+            if is_active:
+                cb = f"skin_deactivate_{card_id}"
+            elif owned:
+                cb = f"skin_activate_{skin['skin_id']}"
+            else:
+                cb = f"skin_buy_{skin['skin_id']}"
+
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=cb)])
+
+        keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"cardinfo_{card_id}")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+    def _skin_callback_target(self, data: str, prefix: str):
+        """New buttons carry only skin_id; resolve old compound buttons too."""
+        payload = data.removeprefix(prefix)
+        skin = self.skins.get_skin(payload)
+        if skin:
+            return skin
+        for index, character in enumerate(payload):
+            if character == "_":
+                skin = self.skins.get_skin(payload[index + 1:])
+                if skin and skin["card_id"] == payload[:index]:
+                    return skin
+        return None
+
+    async def skin_buy_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """خرید اسکین"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        skin = self._skin_callback_target(query.data, "skin_buy_")
+        if not skin:
+            await query.message.reply_text("❌ اسکین پیدا نشد.")
+            return
+        card_id, skin_id = skin["card_id"], skin["skin_id"]
+
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            from systems.progression_economy import ProgressionEconomy
+            quote = ProgressionEconomy(self.db).quote(user_id, 'skin:' + skin_id)
+            if not quote.get('ok'):
+                await query.edit_message_text(quote.get('error','خطا'))
+                return
+            await query.edit_message_text('قیمت پوسته: ' + str(quote['price']) + ' سکه؛ تأیید می‌کنی؟',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('تأیید خرید', callback_data='v2_buy_' + quote['quote_id'])]]))
+            return
+        result = self.skins.unlock_skin(user_id, skin_id)
+
+        if result['success']:
+            skin = self.skins.get_skin(skin_id)
+            text = (
+                f"✅ <b>اسکین خریداری شد!</b>\n\n"
+                f"🎨 {escape(skin['name'])}\n"
+                f"💰 هزینه: {result['coins_spent']} سکه\n"
+                f"💵 موجودی: {result['remaining_coins']:,} سکه"
+            )
+        else:
+            text = f"❌ {escape(result['error'])}"
+
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"skins_menu_{card_id}")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+    async def skin_activate_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """فعال کردن اسکین"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        skin = self._skin_callback_target(query.data, "skin_activate_")
+        if not skin:
+            await query.answer("❌ اسکین پیدا نشد.", show_alert=True)
+            return
+        card_id, skin_id = skin["card_id"], skin["skin_id"]
+
+        result = self.skins.set_active_skin(user_id, card_id, skin_id)
+
+        if result['success']:
+            skin = self.skins.get_skin(skin_id)
+            await query.answer(f"✅ اسکین {skin['name']} فعال شد!", show_alert=False)
+        else:
+            await query.answer(f"❌ {result['error']}", show_alert=True)
+
+        # بازگشت به منوی اسکین
+        await self._show_skins_menu(query, card_id)
+
+    async def skin_deactivate_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """غیرفعال کردن اسکین (بازگشت به پیش‌فرض)"""
+        query = update.callback_query
+        user_id = query.from_user.id
+
+        # skin_deactivate_{card_id}
+        card_id = query.data.split("_", 2)[2]
+
+        result = self.skins.set_active_skin(user_id, card_id, None)
+        await query.answer("✅ اسکین پیش‌فرض فعال شد!" if result['success'] else result['error'],
+                           show_alert=not result['success'])
+
+        await self._show_skins_menu(query, card_id)
+
+    # ==================== MISSION HANDLERS ====================
+
+    async def mission_claim_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دریافت پاداش ماموریت کارت"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        card_id = query.data.removeprefix("mission_claim_")
+
+        result = self.missions.claim_mission_reward(user_id, card_id)
+
+        if result['success']:
+            text = (
+                f"🏆 <b>پاداش ماموریت دریافت شد!</b>\n\n"
+                f"🟡 <b>{escape(result['card_name'])}</b> حالا Legend شد!\n"
+                f"⭐ +{result.get('xp_gained', 30)} XP"
+            )
+        else:
+            text = f"❌ {escape(result['error'])}"
+
+        keyboard = [
+            [InlineKeyboardButton("🎴 کارت‌های من", callback_data="my_cards")],
+            [InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+    # ==================== MINING HANDLER ====================
+
+    async def mining_claim_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دریافت ماینینگ روزانه"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        # محاسبه ماینینگ
+        coins_to_earn = self.economy.calculate_daily_mining(user_id)
+
+        # بررسی cooldown
+        can_claim, error_msg = self.economy.can_claim_mining(user_id)
+
+        if not can_claim:
+            # نمایش وضعیت بدون claim
+            player = self.db.get_or_create_player(user_id)
+            text = (
+                f"⛏️ **ماینینگ روزانه**\n\n"
+                f"⏳ {error_msg}\n\n"
+                f"💰 موجودی فعلی: {getattr(player, 'coins', 0):,} سکه\n"
+                f"📦 درآمد فردا: {coins_to_earn} سکه"
+            )
+            keyboard = [[InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        if coins_to_earn == 0:
+            text = (
+                "⛏️ **ماینینگ روزانه**\n\n"
+                "❌ کارت کافی نداری!\n\n"
+                "برای ماینینگ حداقل **۵ کارت** (Normal/Epic/Legend) نیاز داری.\n"
+                f"📦 کارت‌های فعلی تو: {len([c for c in self.db.get_player_cards(user_id)])}"
+            )
+            keyboard = [
+                [InlineKeyboardButton("🎁 کلیم کارت", callback_data="daily_claim")],
+                [InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")],
+            ]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        # اجرای ماینینگ
+        success, earned, err = self.economy.claim_daily_mining(user_id)
+
+        if success:
+            player = self.db.get_or_create_player(user_id)
+            card_count = len(self.db.get_player_cards(user_id))
+            text = (
+                f"⛏️ **ماینینگ موفق!**\n\n"
+                f"💰 +{earned} سکه دریافت کردی!\n\n"
+                f"📦 کارت‌های تو: {card_count}\n"
+                f"💵 موجودی جدید: {getattr(player, 'coins', 0):,} سکه\n\n"
+                f"⏰ ماینینگ بعدی: فردا"
+            )
+            keyboard = [
+                [InlineKeyboardButton("🔮 Fusion", callback_data="fusion_menu")],
+                [InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")],
+            ]
+        else:
+            text = f"❌ خطا در ماینینگ: {err}"
+            keyboard = [[InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")]]
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    # ==================== SHOP HANDLERS ====================
+
+    async def shop_menu_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """منوی اصلی شاپ"""
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            from bot.handlers.progression import show_menu
+            await update.callback_query.answer()
+            return await show_menu(self, update, context)
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        player = self.db.get_or_create_player(user_id)
+        coins = getattr(player, 'coins', 0)
+        max_hearts = getattr(player, 'max_hearts', 10)
+
+        text = (
+            f"🛒 **شاپ**\n\n"
+            f"💰 موجودی: {coins:,} سکه\n\n"
+            f"چی می‌خوای بخری؟"
+        )
+
+        keyboard = [
+            [InlineKeyboardButton(
+                f"❤️ +۱ قلب دائمی — 200 سکه ({max_hearts}/15)",
+                callback_data="shop_buy_heart"
+            )],
+            [InlineKeyboardButton(
+                "🟢→🟣 ارتقای Normal به Epic — 100 سکه",
+                callback_data="shop_upgrade_epic"
+            )],
+            [InlineKeyboardButton(
+                "🟣→🟡 ارتقای Epic به Legend — 500 سکه",
+                callback_data="shop_upgrade_legend"
+            )],
+            [InlineKeyboardButton(
+                "💱 تبدیل امتیاز به سکه",
+                callback_data="shop_convert_score"
+            )],
+            [InlineKeyboardButton(
+                "🎨 اسکین‌های کارت‌ها",
+                callback_data="shop_skins_list"
+            )],
+            [InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def shop_buy_heart_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """خرید +۱ قلب دائمی"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        success, error = self.economy.buy_heart_increase(user_id)
+
+        if success:
+            player = self.db.get_or_create_player(user_id)
+            new_max = getattr(player, 'max_hearts', 10)
+            # قلب فعلی رو هم آپدیت کن
+            player.hearts = min(player.hearts + 1, new_max)
+            self.db.update_player(player)
+            text = (
+                f"✅ **خرید موفق!**\n\n"
+                f"❤️ حداکثر قلب: {new_max}\n"
+                f"💰 موجودی: {getattr(player, 'coins', 0):,} سکه"
+            )
+        else:
+            text = f"❌ **خرید ناموفق**\n\n{error}"
+
+        keyboard = [
+            [InlineKeyboardButton("🛒 ادامه خرید", callback_data="shop_menu")],
+            [InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def shop_upgrade_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """خرید ارتقای کارت با سکه — انتخاب کارت"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        # shop_upgrade_epic یا shop_upgrade_legend
+        upgrade_type = query.data.split("_")[2]  # 'epic' یا 'legend'
+
+        if upgrade_type == "epic":
+            source_rarity = CardRarity.NORMAL
+            price = self.economy.PRICES['upgrade_normal_to_epic']
+            target_label = "Epic 🟣"
+            eco_key = "normal_to_epic"
+        else:
+            source_rarity = CardRarity.EPIC
+            price = self.economy.PRICES['upgrade_epic_to_legend']
+            target_label = "Legend 🟡"
+            eco_key = "epic_to_legend"
+
+        player = self.db.get_or_create_player(user_id)
+        coins = getattr(player, 'coins', 0)
+
+        if coins < price:
+            await query.edit_message_text(
+                f"❌ سکه کافی نداری!\n\nنیاز: {price} سکه\nموجودی: {coins:,} سکه",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 شاپ", callback_data="shop_menu")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        # نمایش کارت‌های قابل ارتقا
+        cards = self.db.get_player_cards(user_id)
+        eligible = [c for c in cards if c.rarity == source_rarity]
+
+        if not eligible:
+            rarity_name = "Normal" if upgrade_type == "epic" else "Epic"
+            await query.edit_message_text(
+                f"❌ هیچ کارت {rarity_name} نداری!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 شاپ", callback_data="shop_menu")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        context.user_data['shop_upgrade_request_key'] = f"tg-upgrade:{uuid.uuid4().hex}"
+        text = (
+            f"🛒 **ارتقا به {target_label}**\n\n"
+            f"قیمت: {price} سکه\n"
+            f"موجودی: {coins:,} سکه\n\n"
+            f"کدام کارت را ارتقا بدی؟"
+        )
+        keyboard = []
+        for card in eligible:
+            keyboard.append([InlineKeyboardButton(
+                f"{card.name} (P:{card.power} S:{card.speed} IQ:{card.iq})",
+                callback_data=f"shop_confirm_{eco_key}_{card.card_id}"
+            )])
+        keyboard.append([InlineKeyboardButton("🔙 شاپ", callback_data="shop_menu")])
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def shop_confirm_upgrade_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """تأیید و اجرای ارتقای کارت با سکه"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        # shop_confirm_{eco_key}_{card_id}; eco_key itself contains underscores.
+        payload = query.data.removeprefix("shop_confirm_")
+        eco_key = next((key for key in CardUpgradeSystem.UPGRADES if payload.startswith(f"{key}_")), "")
+        card_id = payload[len(eco_key) + 1:] if eco_key else ""
+
+        card = self.db.get_card_by_id_for_player(card_id, user_id)
+        if not card:
+            await query.answer("❌ کارت یافت نشد!", show_alert=True)
+            return
+
+        request_key = context.user_data.get('shop_upgrade_request_key') or f"tg-upgrade:{query.id}"
+        result = CardUpgradeSystem(self.db).upgrade(user_id, card_id, eco_key, request_key)
+        if not result.get("ok"):
+            await query.edit_message_text(
+                f"❌ {result.get('error', 'ارتقای کارت انجام نشد')}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 شاپ", callback_data="shop_menu")]]),
+                parse_mode='Markdown'
+            )
+            return
+        new_rarity = result["to_rarity"]
+        xp_amount = result["xp_gained"]
+        old_lv, new_lv = result["old_level"], result["new_level"]
+        level_text = f"\n⬆️ Level Up! → {new_lv}" if new_lv > old_lv else ""
+
+        player = self.db.get_or_create_player(user_id)
+        target_emoji = "🟣" if new_rarity == "epic" else "🟡"
+        target_label = "Epic" if new_rarity == "epic" else "Legend"
+
+        text = (
+            f"✅ **ارتقا موفق!**\n\n"
+            f"{target_emoji} **{card.name}** حالا {target_label} شد!\n"
+            f"⭐ +{xp_amount} XP{level_text}\n"
+            f"💰 موجودی: {getattr(player, 'coins', 0):,} سکه"
+        )
+        keyboard = [
+            [InlineKeyboardButton("🛒 ادامه خرید", callback_data="shop_menu")],
+            [InlineKeyboardButton("🎴 کارت‌های من", callback_data="my_cards")],
+            [InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def shop_convert_score_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """تبدیل امتیاز به سکه"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        player = self.db.get_or_create_player(user_id)
+        score = player.total_score
+        rate = self.economy.SCORE_TO_COIN_RATE  # هر 100 امتیاز = 1 سکه
+        max_convertible = (score // rate) * rate
+        coins_to_earn = score // rate
+
+        if coins_to_earn == 0:
+            text = (
+                f"💱 **تبدیل امتیاز به سکه**\n\n"
+                f"🏆 امتیاز فعلی: {score}\n"
+                f"❌ حداقل {rate} امتیاز برای تبدیل نیاز است."
+            )
+            keyboard = [[InlineKeyboardButton("🔙 شاپ", callback_data="shop_menu")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        text = (
+            f"💱 **تبدیل امتیاز به سکه**\n\n"
+            f"🏆 امتیاز فعلی: {score:,}\n"
+            f"💰 موجودی سکه: {getattr(player, 'coins', 0):,}\n\n"
+            f"نرخ: هر {rate} امتیاز = ۱ سکه\n\n"
+            f"✅ می‌توانی **{max_convertible:,} امتیاز** را به **{coins_to_earn} سکه** تبدیل کنی.\n\n"
+            f"ادامه می‌دهی؟"
+        )
+        keyboard = [
+            [InlineKeyboardButton(f"✅ تبدیل {coins_to_earn} سکه", callback_data=f"shop_do_convert_{max_convertible}")],
+            [InlineKeyboardButton("🔙 شاپ", callback_data="shop_menu")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def shop_skins_list_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """لیست اسکین‌های قابل خرید در شاپ"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        player = self.db.get_or_create_player(user_id)
+        coins = getattr(player, 'coins', 0)
+
+        # دریافت همه کارت‌های بازیکن که اسکین دارن
+        player_cards = self.db.get_player_cards(user_id)
+        cards_with_skins = []
+        for card in player_cards:
+            skins = self.skins.get_card_skins(card.card_id)
+            if skins:
+                cards_with_skins.append((card, skins))
+
+        if not cards_with_skins:
+            text = (
+                f"🎨 **اسکین‌های شاپ**\n\n"
+                f"💰 موجودی: {coins:,} سکه\n\n"
+                f"هنوز هیچ اسکینی برای کارت‌های شما موجود نیست."
+            )
+            keyboard = [[InlineKeyboardButton("🔙 شاپ", callback_data="shop_menu")]]
+        else:
+            text = (
+                f"🎨 **اسکین‌های شاپ**\n\n"
+                f"💰 موجودی: {coins:,} سکه\n\n"
+                f"کارت مورد نظر را انتخاب کن:"
+            )
+            keyboard = []
+            for card, skins in cards_with_skins[:10]:
+                rarity_emoji = {"normal": "🟢", "epic": "🟣", "legend": "🟡"}.get(card.rarity.value, "⚪")
+                keyboard.append([InlineKeyboardButton(
+                    f"{rarity_emoji} {card.name} ({len(skins)} اسکین)",
+                    callback_data=f"skins_menu_{card.card_id}"
+                )])
+            keyboard.append([InlineKeyboardButton("🔙 شاپ", callback_data="shop_menu")])
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    async def shop_do_convert_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """اجرای تبدیل امتیاز به سکه"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+
+        score_amount = int(query.data.split("_")[3])
+
+        success, earned, error = self.economy.convert_score_to_coins(user_id, score_amount)
+
+        if success:
+            player = self.db.get_or_create_player(user_id)
+            text = (
+                f"✅ **تبدیل موفق!**\n\n"
+                f"💰 +{earned} سکه دریافت کردی!\n"
+                f"💵 موجودی جدید: {getattr(player, 'coins', 0):,} سکه\n"
+                f"🏆 امتیاز باقیمانده: {player.total_score:,}"
+            )
+        else:
+            text = f"❌ {error}"
+
+        keyboard = [
+            [InlineKeyboardButton("🛒 ادامه خرید", callback_data="shop_menu")],
+            [InlineKeyboardButton("🔙 منوی اصلی", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    # ==================== FUSION HANDLERS ====================

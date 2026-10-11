@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>مدیریت کارت‌های TelBattle</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #111f32; --panel-2: #16263b; --line: rgba(255,255,255,.1);
+      --text: #f8fafc; --muted: #9fb0c5; --primary: #22c55e; --primary-2: #15803d;
+      --accent: #f59e0b; --danger: #ef4444; --focus: #86efac; --radius: 16px;
+    }
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top right, #173a31 0, var(--bg) 34rem); color: var(--text); font-family: Tahoma, Arial, sans-serif; line-height: 1.6; }
+    button, input, select, textarea { font: inherit; }
+    button, [role="button"] { cursor: pointer; }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+    .shell { width: min(1440px, 100%); margin: auto; padding: 20px; }
+    .skip-link { position: fixed; top: 8px; right: 8px; z-index: 100; padding: 8px 12px; border-radius: 8px; background: var(--text); color: var(--bg); transform: translateY(-160%); }
+    .skip-link:focus { transform: translateY(0); }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark { width: 46px; height: 46px; display: grid; place-items: center; border-radius: 14px; background: linear-gradient(145deg, var(--primary), var(--primary-2)); box-shadow: 0 10px 30px rgba(34,197,94,.25); }
+    .brand h1 { margin: 0; font-size: clamp(1.2rem, 2vw, 1.7rem); }
+    .brand p { margin: 0; color: var(--muted); font-size: .86rem; }
+    .icon { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .btn { min-height: 44px; border: 1px solid var(--line); border-radius: 12px; padding: 8px 14px; background: var(--panel-2); color: var(--text); display: inline-flex; align-items: center; justify-content: center; gap: 8px; transition: background .2s, border-color .2s, transform .2s; }
+    .btn:hover { background: #20344e; border-color: rgba(255,255,255,.2); }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary { background: var(--primary-2); border-color: var(--primary); }
+    .btn-primary:hover { background: #166534; }
+    .btn-danger { color: #fecaca; border-color: rgba(239,68,68,.35); }
+    .btn-danger:hover { background: rgba(239,68,68,.16); }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+    .stat { border: 1px solid var(--line); background: rgba(17,31,50,.86); border-radius: 14px; padding: 12px 14px; }
+    .stat span { color: var(--muted); font-size: .78rem; }
+    .stat strong { display: block; margin-top: 3px; font-size: 1.2rem; }
+    .workspace { display: grid; grid-template-columns: minmax(270px, 350px) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .panel { border: 1px solid var(--line); background: rgba(17,31,50,.94); border-radius: var(--radius); box-shadow: 0 18px 55px rgba(0,0,0,.2); }
+    .sidebar { position: sticky; top: 16px; max-height: calc(100vh - 32px); display: flex; flex-direction: column; overflow: hidden; }
+    .tools { padding: 14px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
+    .search-row { display: grid; grid-template-columns: 1fr 110px; gap: 8px; }
+    .input { width: 100%; min-height: 44px; border: 1px solid var(--line); border-radius: 11px; padding: 9px 11px; background: #0b1728; color: var(--text); }
+    textarea.input { min-height: 96px; resize: vertical; }
+    .input::placeholder { color: #71839a; }
+    .inline-add { display: flex; gap: 8px; margin-top: 8px; }
+    .inline-add .input { flex: 1; min-width: 0; }
+    select[multiple].input { min-height: 130px; padding: 5px; }
+    select[multiple].input option { padding: 5px 8px; border-radius: 5px; }
+    select[multiple].input option:checked { background: #166534; color: #fff; }
+    .variant-progress { margin: 8px 20px 0; color: var(--muted); font-size: .82rem; }
+    .card-list { overflow: auto; padding: 8px; }
+    .card-row { width: 100%; border: 1px solid transparent; border-radius: 12px; background: transparent; color: inherit; padding: 11px; display: grid; grid-template-columns: 1fr auto; gap: 8px; text-align: right; margin-bottom: 5px; }
+    .card-row:hover { background: rgba(255,255,255,.045); }
+    .card-row.active { background: rgba(34,197,94,.11); border-color: rgba(34,197,94,.5); }
+    .card-row strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .subline { color: var(--muted); font-size: .75rem; margin-top: 2px; }
+    .rarity { align-self: start; border-radius: 999px; padding: 2px 8px; font-size: .7rem; background: #23344b; }
+    .rarity.legend { color: #fde68a; background: rgba(245,158,11,.12); }
+    .rarity.epic { color: #d8b4fe; background: rgba(168,85,247,.12); }
+    .rarity.rare { color: #93c5fd; background: rgba(59,130,246,.12); }
+    .editor { overflow: hidden; }
+    .editor-head { padding: 17px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .editor-head h2 { margin: 0; font-size: 1.15rem; }
+    .editor-head small { color: var(--muted); direction: ltr; }
+    .tabs { display: flex; gap: 4px; overflow-x: auto; padding: 8px 16px 0; border-bottom: 1px solid var(--line); }
+    .tab { min-height: 44px; white-space: nowrap; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); padding: 9px 14px; }
+    .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--primary); }
+    .section { display: none; padding: 20px; }
+    .section.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .field { min-width: 0; }
+    .field.full { grid-column: 1 / -1; }
+    label { display: block; margin-bottom: 5px; color: #dbe6f3; font-size: .86rem; font-weight: 700; }
+    .hint { display: block; color: var(--muted); font-size: .72rem; margin-top: 4px; }
+    .group-title { grid-column: 1 / -1; margin: 12px 0 0; padding-top: 14px; border-top: 1px solid var(--line); color: #bbf7d0; font-size: .9rem; }
+    .switch-line { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+    .switch-line input { width: 20px; height: 20px; accent-color: var(--primary); }
+    fieldset { border: 1px solid var(--line); border-radius: 13px; padding: 14px; margin: 10px 0 0; }
+    fieldset:disabled { opacity: .5; }
+    legend { padding: 0 7px; color: var(--muted); }
+    .preview { min-height: 180px; border: 1px dashed rgba(255,255,255,.18); border-radius: 14px; display: grid; place-items: center; overflow: hidden; background: #0b1728; color: var(--muted); }
+    .preview img { display: block; width: 100%; max-height: 330px; object-fit: contain; }
+    .upload { border: 1px solid var(--line); border-radius: 13px; padding: 13px; background: rgba(255,255,255,.025); }
+    .upload + .upload { margin-top: 10px; }
+    .actions { position: sticky; bottom: 0; z-index: 4; display: flex; justify-content: space-between; gap: 10px; padding: 13px 20px; border-top: 1px solid var(--line); background: rgba(17,31,50,.96); backdrop-filter: blur(12px); }
+    .actions > div { display: flex; gap: 8px; }
+    .empty { padding: 80px 24px; text-align: center; color: var(--muted); }
+    .empty strong { display: block; color: var(--text); margin-bottom: 6px; }
+    .toast { position: fixed; left: 20px; bottom: 20px; z-index: 20; max-width: min(420px, calc(100vw - 40px)); padding: 12px 16px; border-radius: 12px; background: #172a42; border: 1px solid var(--line); box-shadow: 0 15px 45px rgba(0,0,0,.35); transform: translateY(120%); transition: transform .25s; }
+    .toast.show { transform: translateY(0); }
+    .toast.error { border-color: rgba(239,68,68,.55); color: #fecaca; }
+    .loading { opacity: .55; pointer-events: none; }
+    [hidden] { display: none !important; }
+    @media (max-width: 980px) { .workspace { grid-template-columns: 1fr; } .sidebar { position: static; max-height: 420px; } .stats { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 620px) { .shell { padding: 10px; } .topbar { align-items: flex-start; } .brand p { display: none; } .grid, .grid-4 { grid-template-columns: 1fr; } .search-row { grid-template-columns: 1fr; } .inline-add { flex-direction: column; } .inline-add .btn { width: 100%; } .editor-head { align-items: flex-start; flex-direction: column; } .actions { flex-direction: column; } .actions > div, .actions .btn { width: 100%; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">پرش به ویرایشگر کارت</a>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="m9 9 3-2 3 2-1 4h-4z"/></svg>
+        </div>
+        <div><h1>مدیریت کارت‌های TelBattle</h1><p>ویرایش داده‌های پایه و مودهای Quick، Deck و Easy</p></div>
+      </div>
+      <div class="actions"><a class="btn" href="arenas">مدیریت زمین‌ها</a><button id="refreshBtn" class="btn" type="button" aria-label="بارگذاری دوباره کارت‌ها">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg> بروزرسانی
+      </button></div>
+    </header>
+
+    <section class="stats" aria-label="خلاصه کارت‌ها">
+      <div class="stat"><span>کل کارت‌ها</span><strong id="totalCards">—</strong></div>
+      <div class="stat"><span>دارای Trait</span><strong id="traitCards">—</strong></div>
+      <div class="stat"><span>دارای Series</span><strong id="seriesCards">—</strong></div>
+      <div class="stat"><span>دارای Passive</span><strong id="passiveCards">—</strong></div>
+    </section>
+
+    <div id="workspace" class="workspace">
+      <aside class="panel sidebar" aria-label="فهرست کارت‌ها">
+        <div class="tools">
+          <button id="newBtn" class="btn btn-primary" type="button">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg> کارت جدید
+          </button>
+          <div class="search-row">
+            <input id="search" class="input" type="search" placeholder="جستجوی نام، Trait یا Series" aria-label="جستجوی کارت">
+            <select id="rarityFilter" class="input" aria-label="فیلتر کمیابی">
+              <option value="">همه</option><option value="normal">Normal</option><option value="epic">Epic</option><option value="legend">Legend</option><option value="rare">Rare</option>
+            </select>
+          </div>
+        </div>
+        <div id="cardList" class="card-list" aria-live="polite"></div>
+      </aside>
+
+      <section class="panel editor" aria-label="ویرایشگر کارت">
+        <div id="emptyState" class="empty"><strong>یک کارت را انتخاب کنید</strong>یا با دکمه «کارت جدید» یک تعریف تازه بسازید.</div>
+        <form id="cardForm" hidden novalidate>
+          <div class="editor-head"><div><h2 id="editorTitle">کارت جدید</h2><small id="cardId">new</small></div><span id="saveState" class="subline">تغییری ذخیره نشده</span></div>
+          <p id="variantProgress" class="variant-progress" aria-live="polite">هر سه فرم را تکمیل کنید؛ با «ذخیره کارت» همه با هم ثبت می‌شوند.</p>
+          <div class="tabs" role="tablist" aria-label="بخش‌های فرم">
+            <button class="tab" type="button" role="tab" data-tab="base" aria-selected="true">اطلاعات پایه</button>
+            <button class="tab" type="button" role="tab" data-tab="modes" aria-selected="false">مودهای جدید</button>
+            <button class="tab" type="button" role="tab" data-tab="media" aria-selected="false">رسانه</button>
+          </div>
+
+          <div class="section active" data-section="base">
+            <div class="grid">
+              <div class="field"><label for="name">نام کارت</label><input id="name" class="input" required maxlength="100"></div>
+              <div class="field"><label for="rarity">فرم قابل ویرایش</label><select id="rarity" class="input"><option value="normal">Normal</option><option value="epic">Epic</option><option value="legend">Legend</option></select><span id="variantHint" class="hint">هر فرم آمار، Ability، Passive و مدیای مستقل دارد؛ تغییر فرم، داده‌های واردشده را نگه می‌دارد.</span></div>
+              <div class="field"><label for="cardType">نوع اصلی</label><select id="cardType" class="input"><option value="POWER_TYPE">Power</option><option value="SPEED_TYPE">Speed</option><option value="IQ_TYPE">IQ</option><option value="POPULARITY_TYPE">Popularity</option></select><span class="hint">برای منطق‌های قدیمی و دسته‌بندی کارت استفاده می‌شود.</span></div>
+              <div class="field"><label for="abilities">Abilityهای شخصیت</label><input id="abilities" class="input" placeholder="Leadership, Survivor"><span class="hint">با ویرگول جدا کنید؛ با Ability مصرفی Quick متفاوت است.</span></div>
+              <div class="group-title">Statهای اصلی (۱ تا ۱۰۰)</div>
+              <div class="grid grid-4 field full">
+                <div><label for="power">قدرت</label><input id="power" class="input" type="number" min="1" max="100" required></div>
+                <div><label for="speed">سرعت</label><input id="speed" class="input" type="number" min="1" max="100" required></div>
+                <div><label for="iq">هوش</label><input id="iq" class="input" type="number" min="1" max="100" required></div>
+                <div><label for="popularity">محبوبیت</label><input id="popularity" class="input" type="number" min="1" max="100" required></div>
+              </div>
+              <div class="field full"><label for="cardEffects">Effectهای موتور قدیمی</label><select id="cardEffects" class="input" multiple><option value="reflect">Reflect / بازتاب</option><option value="drain">Drain / جذب</option><option value="arena_shift">Arena Shift / تغییر زمین</option></select><span class="hint">چند مورد را انتخاب کنید (Ctrl یا لمس چند گزینه). در Deck جدید اعمال نمی‌شوند.</span></div>
+              <div class="field full"><label for="biography">بیوگرافی</label><textarea id="biography" class="input"></textarea></div>
+              <div class="field full"><label for="dialogs">دیالوگ‌های پیروزی</label><textarea id="dialogs" class="input" placeholder="هر دیالوگ در یک خط"></textarea></div>
+            </div>
+          </div>
+
+          <div class="section" data-section="modes">
+            <div class="grid">
+              <div class="field"><label for="traits">Traitها</label><select id="traits" class="input" multiple></select><div class="inline-add"><input id="newTrait" class="input" type="text" maxlength="100" placeholder="Trait جدید را بنویسید" aria-label="Trait جدید"><button id="addTraitBtn" class="btn" type="button">افزودن Trait</button></div><span class="hint">با افزودن، Trait در فهرست دائمی ذخیره و خودکار انتخاب می‌شود؛ حتی اگر از همهٔ کارت‌ها برداشته شود، در فهرست می‌ماند. برای ثبت انتخاب‌ها روی کارت، کارت را ذخیره کنید.</span></div>
+              <div class="field"><label for="series">Series / مجموعه</label><input id="series" class="input" list="seriesOptions" placeholder="Game of Thrones"><datalist id="seriesOptions"></datalist><span class="hint">از مجموعه‌های قبلی انتخاب کنید یا نام تازه بنویسید.</span></div>
+              <div class="group-title">Hidden Stats برای Easy (اختیاری)</div>
+              <div class="grid grid-4 field full">
+                <div><label for="funny">بامزگی</label><input id="funny" class="input hidden-stat" type="number" min="1" max="100"></div>
+                <div><label for="scary">ترسناکی</label><input id="scary" class="input hidden-stat" type="number" min="1" max="100"></div>
+                <div><label for="charisma">کاریزما</label><input id="charisma" class="input hidden-stat" type="number" min="1" max="100"></div>
+                <div><label for="cute">کیوتی</label><input id="cute" class="input hidden-stat" type="number" min="1" max="100"></div>
+                <div><label for="evil">شرارت</label><input id="evil" class="input hidden-stat" type="number" min="1" max="100"></div>
+                <div><label for="leadership">رهبری</label><input id="leadership" class="input hidden-stat" type="number" min="1" max="100"></div>
+              </div>
+              <div class="group-title">Passive خودکار Quick</div>
+              <div class="field full switch-line"><input id="passiveEnabled" type="checkbox"><label for="passiveEnabled" style="margin:0">این کارت Passive دارد</label></div>
+              <fieldset id="passiveFields" class="field full" disabled>
+                <legend>شرط و اثر Passive</legend>
+                <div class="grid">
+                  <div class="field"><label for="passiveName">نام</label><input id="passiveName" class="input" placeholder="فرمانده میدان"></div>
+                  <div class="field"><label for="conditionType">نوع شرط</label><select id="conditionType" class="input"><option value="arena">زمین مشخص</option><option value="opponent_trait">Trait حریف</option><option value="opponent_name">نام حریف</option></select></div>
+                  <div class="field"><label for="conditionValue">مقدار شرط</label><select id="conditionValue" class="input"></select><span class="hint">گزینه‌ها با نوع شرط عوض می‌شوند.</span></div>
+                  <div class="field"><label for="passiveStat">Stat هدف</label><select id="passiveStat" class="input"><option value="power">Power</option><option value="speed">Speed</option><option value="iq">IQ</option><option value="popularity">Popularity</option></select></div>
+                  <div class="field"><label for="passiveDelta">مقدار تغییر</label><input id="passiveDelta" class="input" type="number" min="-100" max="100" value="1"></div>
+                </div>
+              </fieldset>
+            </div>
+          </div>
+
+          <div class="section" data-section="media">
+            <div class="grid">
+              <div class="field">
+                <label>پیش‌نمایش تصویر</label><div id="imagePreview" class="preview">هنوز تصویری ثبت نشده است.</div>
+              </div>
+              <div class="field">
+                <label for="imagePath">مسیر تصویر در پروژه</label><input id="imagePath" class="input" list="imageOptions" placeholder="assets/card_images/card.png"><datalist id="imageOptions"></datalist><span class="hint">از تصویرهای موجود انتخاب کنید یا تصویر تازه آپلود کنید.</span>
+                <div class="upload"><label for="imageFile">آپلود PNG/JPG/WebP فرم انتخابی</label><input id="imageFile" class="input" type="file" accept="image/png,image/jpeg,image/webp"><button id="uploadImageBtn" class="btn" type="button" style="margin-top:8px">آپلود تصویر فرم</button></div>
+                <div class="upload"><label for="stickerFile">آپلود Sticker WebP فرم انتخابی</label><input id="stickerFile" class="input" type="file" accept="image/webp,.webp"><button id="uploadStickerBtn" class="btn" type="button" style="margin-top:8px">آپلود استیکر فرم</button><span class="hint">هر فایل با نام شخصیت و فرم انتخابی ذخیره می‌شود.</span></div>
+              </div>
+              <div class="field full"><label for="photoFileId">Telegram Photo file_id</label><input id="photoFileId" class="input" dir="ltr"><span class="hint">اختیاری؛ برای Inline Picker بدون آپلود دوباره.</span></div>
+              <div class="field full"><label for="stickerFileId">Telegram Sticker file_id</label><input id="stickerFileId" class="input" dir="ltr"><span class="hint">اگر وارد شود، Easy و Deck مستقیماً از Sticker تلگرام استفاده می‌کنند.</span></div>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="deleteBtn" class="btn btn-danger" type="button">حذف کارت</button>
+            <div><button id="cancelBtn" class="btn" type="button">لغو تغییرات</button><button id="saveBtn" class="btn btn-primary" type="submit">ذخیره کارت</button></div>
+          </div>
+        </form>
+      </section>
+    </div>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const state = { cards: [], selectedId: null, selectedCard: null, creating: false, busy: false, drafts: {}, currentRarity: 'normal', options: {arenas:[], traits:[], series:[], names:[], images:[]} };
+    const apiPrefix = window.location.pathname.startsWith('/card-admin') ? '/card-admin' : '';
+    const $ = id => document.getElementById(id);
+    const splitList = value => [...new Set(String(value || '').split(/[\n,،]+/).map(x => x.trim()).filter(Boolean))];
+    const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+    const rarityLabel = { normal: 'Normal', epic: 'Epic', legend: 'Legend', rare: 'Rare' };
+    const rarities = ['normal', 'epic', 'legend'];
+    const selectedValues = id => [...$(id).selectedOptions].map(option => option.value);
+    function setChoices(id, values, selected = []) {
+      const choices = [...new Set([...values, ...selected].filter(Boolean))];
+      $(id).replaceChildren(...choices.map(value => {
+        const option = new Option(value, value, false, selected.includes(value));
+        return option;
+      }));
+    }
+    function setMultiValues(id, selected) {
+      const values = selected || [];
+      values.forEach(value => { if (![...$(id).options].some(option => option.value === value)) $(id).add(new Option(value, value)); });
+      [...$(id).options].forEach(option => option.selected = values.includes(option.value));
+    }
+    async function addTrait() {
+      const button = $('addTraitBtn');
+      if (button.disabled) return;
+      const input = $('newTrait'); const name = input.value.trim();
+      if (!name) { toast('نام Trait را وارد کنید', true); input.focus(); return; }
+      button.disabled = true; input.disabled = true;
+      try {
+        const data = await api('/api/card-editor/traits', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+        state.options.traits = data.traits;
+        setChoices('traits', state.options.traits, [...selectedValues('traits'), data.trait]);
+        refreshConditionChoices($('conditionValue').value);
+        input.value = '';
+        toast(`Trait «${data.trait}» در فهرست دائمی ثبت شد؛ برای اعمال روی کارت، کارت را ذخیره کنید`);
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; input.disabled = false; input.focus(); }
+    }
+    function refreshConditionChoices(value = '') {
+      const type = $('conditionType').value;
+      const values = type === 'arena' ? state.options.arenas : type === 'opponent_trait' ? state.options.traits : state.options.names;
+      setChoices('conditionValue', values, value ? [value] : []);
+      if (!value) $('conditionValue').selectedIndex = -1;
+    }
+    async function loadOptions() {
+      try {
+        state.options = await api('/api/card-editor/options');
+        setChoices('seriesOptions', state.options.series);
+        setChoices('imageOptions', state.options.images);
+        setChoices('traits', state.options.traits, selectedValues('traits'));
+        refreshConditionChoices($('conditionValue').value);
+      } catch (error) { toast(error.message, true); }
+    }
+
+    function toast(message, error = false) {
+      const node = $('toast'); node.textContent = message; node.className = `toast show${error ? ' error' : ''}`;
+      clearTimeout(toast.timer); toast.timer = setTimeout(() => node.className = 'toast', 3200);
+    }
+    function revealEditor() {
+      if (!matchMedia('(max-width: 980px)').matches) return;
+      const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      requestAnimationFrame(() => document.querySelector('.editor').scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' }));
+    }
+    async function api(url, options = {}) {
+      const response = await fetch(`${apiPrefix}${url}`, options); let data = {};
+      try { data = await response.json(); } catch (_) {}
+      if (!response.ok || data.success === false) throw new Error(data.error || `خطای HTTP ${response.status}`);
+      return data;
+    }
+    function setBusy(value) {
+      state.busy = value; $('cardForm').classList.toggle('loading', value); $('saveBtn').disabled = value;
+      $('saveState').textContent = value ? 'در حال ذخیره…' : 'آماده ذخیره';
+    }
+    function renderStats() {
+      $('totalCards').textContent = state.cards.length.toLocaleString('fa-IR');
+      $('traitCards').textContent = state.cards.filter(c => c.traits?.length).length.toLocaleString('fa-IR');
+      $('seriesCards').textContent = state.cards.filter(c => c.series).length.toLocaleString('fa-IR');
+      $('passiveCards').textContent = state.cards.filter(c => c.passive && Object.keys(c.passive).length).length.toLocaleString('fa-IR');
+    }
+    function renderList() {
+      const term = $('search').value.trim().toLowerCase(); const rarity = $('rarityFilter').value;
+      const cards = state.cards.filter(card => {
+        const haystack = [card.name, card.series, ...(card.traits || [])].join(' ').toLowerCase();
+        return (!term || haystack.includes(term)) && (!rarity || card.rarity === rarity);
+      });
+      $('cardList').innerHTML = cards.length ? cards.map(card => `
+        <button type="button" class="card-row ${state.selectedId === card.id ? 'active' : ''}" data-card-id="${escapeHtml(card.id)}">
+          <span><strong>${escapeHtml(card.name)}</strong><span class="subline">${escapeHtml(card.series || 'بدون Series')} · ${(card.traits || []).length} Trait</span></span>
+          <span class="rarity ${escapeHtml(card.rarity)}">${rarityLabel[card.rarity] || escapeHtml(card.rarity)}</span>
+        </button>`).join('') : '<div class="empty" style="padding:35px 12px">کارتی با این فیلتر پیدا نشد.</div>';
+    }
+    async function loadCards(preferredId = state.selectedId) {
+      try {
+        const data = await api('/api/cards'); state.cards = data.cards || []; renderStats();
+        if (preferredId && state.cards.some(card => card.id === preferredId)) selectCard(preferredId); else renderList();
+      } catch (error) { toast(error.message, true); }
+    }
+    function blankVariant() { return { card_type:'POWER_TYPE', power:'', speed:'', iq:'', popularity:'', abilities:[], card_effects:[], passive:{}, image_path:'', photo_file_id:'', sticker_file_id:'' }; }
+    function blankCard() { return { name:'', rarity:'normal', biography:'', dialogs:[], traits:[], series:'', hidden_stats:{}, variants:[] }; }
+    function selectCard(id) {
+      const card = state.cards.find(item => item.id === id); if (!card) return;
+      state.selectedId = id; state.selectedCard = card; state.creating = false; fillForm(card); renderList(); revealEditor();
+    }
+    function startNew() { state.selectedId = null; state.selectedCard = null; state.creating = true; fillForm(blankCard()); renderList(); revealEditor(); }
+    function collectVariant() {
+      let passive = {};
+      if ($('passiveEnabled').checked) {
+        const type = $('conditionType').value, value = $('conditionValue').value.trim();
+        passive = { name:$('passiveName').value.trim() || 'Passive', condition:{[type]:value}, effect:{stat:$('passiveStat').value, delta:Number($('passiveDelta').value)} };
+      }
+      return { card_type:$('cardType').value, power:$('power').value, speed:$('speed').value,
+        iq:$('iq').value, popularity:$('popularity').value, abilities:splitList($('abilities').value),
+        card_effects:selectedValues('cardEffects'), passive, image_path:$('imagePath').value.trim(),
+        photo_file_id:$('photoFileId').value.trim(), sticker_file_id:$('stickerFileId').value.trim() };
+    }
+    function stashVariant() { state.drafts[state.currentRarity] = collectVariant(); updateVariantProgress(); }
+    function updateVariantProgress() {
+      $('variantProgress').textContent = rarities.map(rarity => {
+        const variant = state.drafts[rarity] || {};
+        const ready = ['power','speed','iq','popularity'].every(stat => variant[stat] !== '' && variant[stat] != null);
+        return `${rarityLabel[rarity]} ${ready ? '✓' : '○'}`;
+      }).join('  ·  ') + ' — هر سه فرم با هم ذخیره می‌شوند.';
+    }
+    function fillVariant(variant) {
+      $('cardType').value = variant.card_type || 'POWER_TYPE';
+      ['power','speed','iq','popularity'].forEach(key => $(key).value = variant[key] ?? '');
+      $('abilities').value = (variant.abilities || []).join(', '); setMultiValues('cardEffects', variant.card_effects || []);
+      const passive = variant.passive || {}; $('passiveEnabled').checked = Object.keys(passive).length > 0; $('passiveFields').disabled = !$('passiveEnabled').checked;
+      $('passiveName').value = passive.name || ''; const condition = passive.condition || {}; const conditionType = Object.keys(condition)[0] || 'arena'; $('conditionType').value = conditionType; refreshConditionChoices(condition[conditionType] || ''); $('passiveStat').value = passive.effect?.stat || 'power'; $('passiveDelta').value = passive.effect?.delta ?? 1;
+      $('imagePath').value = variant.image_path || ''; $('photoFileId').value = variant.photo_file_id || ''; $('stickerFileId').value = variant.sticker_file_id || '';
+      $('variantHint').textContent = `در حال ویرایش فرم ${rarityLabel[state.currentRarity]}: آمار، Ability، Passive و مدیا مستقل است.`;
+      updatePreview();
+    }
+    function fillForm(card) {
+      $('emptyState').hidden = true; $('cardForm').hidden = false; $('editorTitle').textContent = state.creating ? 'کارت جدید' : card.name; $('cardId').textContent = state.creating ? 'new' : card.id;
+      $('name').value = card.name || ''; state.currentRarity = 'normal'; $('rarity').value = 'normal'; $('biography').value = card.biography || ''; $('dialogs').value = (card.dialogs || []).join('\n');
+      setChoices('traits', state.options.traits, card.traits || []); $('newTrait').value = ''; $('series').value = card.series || '';
+      ['funny','scary','charisma','cute','evil','leadership'].forEach(key => $(key).value = card.hidden_stats?.[key] ?? '');
+      state.drafts = Object.fromEntries(rarities.map(rarity => {
+        const source = (card.variants || []).find(item => item.rarity === rarity) || (card.rarity === rarity ? card : blankVariant());
+        const form = Object.fromEntries(['power','speed','iq','popularity','card_type','abilities','card_effects','passive','image_path','photo_file_id','sticker_file_id'].map(key => [key, source[key] ?? blankVariant()[key]]));
+        if (!Object.keys(form.passive || {}).length && card.legacy_passive && Object.keys(card.legacy_passive).length) form.passive = card.legacy_passive;
+        return [rarity, form];
+      }));
+      fillVariant(state.drafts.normal); updateVariantProgress(); $('deleteBtn').hidden = state.creating; $('saveState').textContent = 'آماده ویرایش'; activateTab('base');
+    }
+    function collectPayload() {
+      const name = $('name').value.trim();
+      if (!name || name.length > 100) throw new Error('نام کارت باید بین ۱ تا ۱۰۰ کاراکتر باشد');
+      const hidden = {}; ['funny','scary','charisma','cute','evil','leadership'].forEach(key => {
+        if ($(key).value !== '') {
+          const value = Number($(key).value);
+          if (!Number.isInteger(value) || value < 1 || value > 100) throw new Error(`Hidden Stat ${key} باید بین ۱ تا ۱۰۰ باشد`);
+          hidden[key] = value;
+        }
+      });
+      stashVariant();
+      for (const rarity of rarities) for (const stat of ['power','speed','iq','popularity']) {
+        const value = state.drafts[rarity][stat];
+        if (value === '' || value == null || !Number.isInteger(Number(value)) || Number(value) < 1 || Number(value) > 100)
+          throw new Error(`فرم ${rarityLabel[rarity]}: مقدار ${stat} باید عدد صحیح بین ۱ تا ۱۰۰ باشد`);
+      }
+      for (const rarity of rarities) if (state.drafts[rarity].passive?.condition && !Object.values(state.drafts[rarity].passive.condition)[0])
+        throw new Error(`فرم ${rarityLabel[rarity]}: مقدار شرط Passive را انتخاب کنید`);
+      return { name, biography:$('biography').value.trim(), dialogs:splitList($('dialogs').value),
+        traits:selectedValues('traits'), series:$('series').value.trim(), hidden_stats:hidden,
+        variants:Object.fromEntries(rarities.map(rarity => [rarity, state.drafts[rarity]])) };
+    }
+    async function saveCard(event) {
+      event.preventDefault(); if (state.busy) return;
+      try { const payload = collectPayload(); setBusy(true); const url = state.creating ? '/api/cards/family' : `/api/cards/${encodeURIComponent(state.selectedId)}/family`; const method = state.creating ? 'POST' : 'PUT'; const data = await api(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); state.selectedId = data.card.id; state.creating = false; toast(data.message); await loadCards(state.selectedId); await loadOptions(); }
+      catch (error) { toast(error.message, true); } finally { setBusy(false); }
+    }
+    async function deleteCard() {
+      const card = state.cards.find(item => item.id === state.selectedId); if (!card || !confirm(`کارت «${card.name}» حذف شود؟ این کار روی مالکان کارت هم اثر می‌گذارد.`)) return;
+      try { setBusy(true); await api(`/api/cards/${encodeURIComponent(card.id)}`, {method:'DELETE'}); toast('کارت حذف شد'); state.selectedId = null; state.creating = false; $('cardForm').hidden = true; $('emptyState').hidden = false; await loadCards(); }
+      catch (error) { toast(error.message, true); } finally { setBusy(false); }
+    }
+    function activateTab(name) { document.querySelectorAll('.tab').forEach(tab => tab.setAttribute('aria-selected', String(tab.dataset.tab === name))); document.querySelectorAll('.section').forEach(section => section.classList.toggle('active', section.dataset.section === name)); }
+    function updatePreview() { const path = $('imagePath').value.trim(); const node = $('imagePreview'); if (!path) { node.textContent = 'هنوز تصویری ثبت نشده است.'; return; } const filename = path.split(/[\\/]/).pop(); node.innerHTML = `<img src="${apiPrefix}/card_images/${encodeURIComponent(filename)}" alt="پیش‌نمایش کارت ${escapeHtml($('name').value || '')}" onerror="this.parentElement.textContent='تصویر پیدا نشد'">`; }
+    async function upload(kind) {
+      const input = kind === 'image' ? $('imageFile') : $('stickerFile'); if (!input.files[0]) return toast('ابتدا فایل را انتخاب کنید', true); if (!$('name').value.trim()) return toast('قبل از آپلود، نام کارت را وارد کنید', true);
+      const form = new FormData(); form.append(kind, input.files[0]); form.append('card_name', $('name').value.trim()); form.append('rarity', $('rarity').value);
+      try { const data = await api(`/api/upload_${kind}`, {method:'POST', body:form}); if (data.image_path) { $('imagePath').value = data.image_path; updatePreview(); } toast(data.message); }
+      catch (error) { toast(error.message, true); }
+    }
+    $('cardList').addEventListener('click', event => { const button = event.target.closest('[data-card-id]'); if (button) selectCard(button.dataset.cardId); });
+    $('newBtn').addEventListener('click', startNew); $('refreshBtn').addEventListener('click', async () => { await loadCards(); await loadOptions(); }); $('search').addEventListener('input', renderList); $('rarityFilter').addEventListener('change', renderList); $('rarity').addEventListener('change', () => { stashVariant(); state.currentRarity = $('rarity').value; fillVariant(state.drafts[state.currentRarity]); });
+    $('cardForm').addEventListener('submit', saveCard); $('deleteBtn').addEventListener('click', deleteCard); $('cancelBtn').addEventListener('click', () => state.selectedId ? selectCard(state.selectedId) : startNew());
+    $('addTraitBtn').addEventListener('click', addTrait); $('newTrait').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); addTrait(); } });
+    $('passiveEnabled').addEventListener('change', () => $('passiveFields').disabled = !$('passiveEnabled').checked); $('conditionType').addEventListener('change', () => refreshConditionChoices()); $('imagePath').addEventListener('input', () => { $('photoFileId').value = ''; updatePreview(); }); $('name').addEventListener('input', () => { if (!state.creating) $('editorTitle').textContent = $('name').value || 'بدون نام'; });
+    $('uploadImageBtn').addEventListener('click', () => upload('image')); $('uploadStickerBtn').addEventListener('click', () => upload('sticker')); document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => activateTab(tab.dataset.tab)));
+    Promise.all([loadCards(), loadOptions()]);
+  </script>
+</body>
+</html>

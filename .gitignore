@@ -1,0 +1,54 @@
+﻿.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+dist/
+.DS_Store
+Thumbs.db
+
+# Private configuration and local data
+game_config.json
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and backup files
+*.log
+*.bak
+on_setup.py
+.scriptsadmin_setup.py.bak
+
+duplicate-images-report.csv
+assets/stickers/
+assets/mini app designs/
+# Generated files and local data
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+game_config.json
+duplicate-images-report.csv
+
+# Image assets
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.ico
+
+*.ttf

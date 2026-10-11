@@ -1,0 +1,270 @@
+"""Transactional Claim, card mission rewards, and skin management."""
+
+from __future__ import annotations
+
+import json
+import random
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List
+from zoneinfo import ZoneInfo
+
+from systems.card_missions_system import MISSION_TYPES
+from systems.phase2_systems import LevelSystem
+from systems.game_mode_system import ABILITY_DEFINITIONS, GameModeSystem
+from systems.card_inventory_system import CardInventorySystem
+
+
+class PlayerRewardsSystem:
+    CLAIM_TIMEZONE = ZoneInfo("Asia/Tehran")
+
+    def __init__(self, db):
+        self.db = db
+
+    @staticmethod
+    def _claim_status_from(last_claim: str | None) -> Dict[str, Any]:
+        now = datetime.now(PlayerRewardsSystem.CLAIM_TIMEZONE)
+        if last_claim:
+            try:
+                claimed = datetime.fromisoformat(last_claim)
+                if claimed.tzinfo is None:
+                    claimed = claimed.replace(tzinfo=timezone.utc)
+                claimed = claimed.astimezone(PlayerRewardsSystem.CLAIM_TIMEZONE)
+                if claimed.date() == now.date():
+                    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=PlayerRewardsSystem.CLAIM_TIMEZONE)
+                    return {"can_claim": False, "remaining_seconds": max(0, int((midnight - now).total_seconds()))}
+            except ValueError:
+                pass
+        return {"can_claim": True, "remaining_seconds": 0}
+
+    def claim_status(self, user_id: int) -> Dict[str, Any]:
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            from systems.progression_economy import ProgressionEconomy
+            return ProgressionEconomy(self.db).claim_status(user_id)
+        conn = sqlite3.connect(self.db.db_path)
+        try:
+            row = conn.execute("SELECT last_claim FROM players WHERE user_id=?", (user_id,)).fetchone()
+            status = self._claim_status_from(row[0] if row else None)
+            pool = conn.execute(
+                "SELECT COUNT(*) FROM cards WHERE rarity='normal' AND origin='official'"
+            ).fetchone()[0]
+            return {
+                **status,
+                "can_claim": status["can_claim"] and pool > 0,
+                "pool_count": int(pool),
+                "pool_exhausted": pool == 0,
+            }
+        finally:
+            conn.close()
+
+    def claim_daily(self, user_id: int) -> Dict[str, Any]:
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            from systems.progression_economy import ProgressionEconomy
+            return ProgressionEconomy(self.db).claim(user_id)
+        # The Quick inventory and its definitions must exist before the claim
+        # transaction, including when the Telegram bot starts before the web app.
+        GameModeSystem(self.db)
+        conn = sqlite3.connect(self.db.db_path, timeout=15)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            player = conn.execute("SELECT last_claim FROM players WHERE user_id=?", (user_id,)).fetchone()
+            if not player:
+                conn.rollback()
+                return {"ok": False, "error_code": "player_not_found", "error": "بازیکن پیدا نشد"}
+            status = self._claim_status_from(player["last_claim"])
+            if not status["can_claim"]:
+                conn.rollback()
+                return {"ok": False, "error_code": "already_claimed", "error": "کارت روزانه امروز دریافت شده است", **status}
+            rows = conn.execute(
+                "SELECT card_id FROM cards WHERE rarity='normal' AND origin='official'"
+            ).fetchall()
+            if not rows:
+                conn.rollback()
+                return {"ok": False, "error_code": "empty_pool", "error": "هیچ کارت Normal در کاتالوگ نیست؛ دریافت روزانه مصرف نشد"}
+            card_id = random.choice(rows)["card_id"]
+            quantity = CardInventorySystem.grant_in(conn, user_id, card_id, "normal")
+            conn.execute("UPDATE players SET last_claim=? WHERE user_id=?", (datetime.now(timezone.utc).isoformat(), user_id))
+            ability_key = random.choice(tuple(ABILITY_DEFINITIONS))
+            conn.execute(
+                """INSERT INTO player_ability_inventory(user_id, ability_key, quantity)
+                   VALUES (?, ?, 1)
+                   ON CONFLICT(user_id, ability_key)
+                   DO UPDATE SET quantity=quantity+1""",
+                (user_id, ability_key),
+            )
+            conn.commit()
+            return {"ok": True, "card_id": card_id, "rarity": "normal", "quantity": quantity, "ability": {
+                "key": ability_key,
+                "title": ABILITY_DEFINITIONS[ability_key]["title"],
+            }}
+        except Exception:
+            conn.rollback()
+            return {"ok": False, "error_code": "claim_failed", "error": "دریافت کارت انجام نشد"}
+        finally:
+            conn.close()
+
+    def missions(self, user_id: int) -> List[Dict[str, Any]]:
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            from systems.progression_missions import ProgressionMissions
+            return ProgressionMissions(self.db).list(user_id)
+        conn = sqlite3.connect(self.db.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT m.card_id, c.name AS card_name, m.mission_type, m.target, m.target_card,
+                       COALESCE(pm.current_progress,0) AS current_progress,
+                       COALESCE(pm.completed,0) AS completed,
+                       COALESCE(pm.reward_claimed,0) AS reward_claimed,
+                       COALESCE(pc.rarity_override,c.rarity) AS rarity
+                FROM card_missions m
+                JOIN cards c ON c.card_id=m.card_id
+                JOIN player_cards pc ON pc.card_id=m.card_id AND pc.user_id=?
+                LEFT JOIN player_card_missions pm ON pm.user_id=? AND pm.card_id=m.card_id
+                WHERE c.origin='official'
+                ORDER BY completed DESC, current_progress DESC, c.name COLLATE NOCASE
+                """,
+                (user_id, user_id),
+            ).fetchall()
+            result = []
+            for row in rows:
+                info = MISSION_TYPES.get(row["mission_type"], {})
+                result.append({
+                    "mission_id": row["card_id"], "card_id": row["card_id"], "card_name": row["card_name"],
+                    "mission_type": row["mission_type"], "name": info.get("name_fa", "ماموریت کارت"),
+                    "description": info.get("description", "").format(target=row["target"], target_card=row["target_card"] or ""),
+                    "target": int(row["target"]), "current_progress": int(row["current_progress"]),
+                    "progress_percent": min(100, int(int(row["current_progress"]) * 100 / max(1, int(row["target"])))),
+                    "completed": bool(row["completed"]), "reward_claimed": bool(row["reward_claimed"]),
+                    "rarity": row["rarity"], "can_claim": bool(row["completed"]) and not bool(row["reward_claimed"]) and row["rarity"] == "epic",
+                })
+            return result
+        finally:
+            conn.close()
+
+    def claim_mission(self, user_id: int, card_id: str) -> Dict[str, Any]:
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            from systems.progression_missions import ProgressionMissions
+            return ProgressionMissions(self.db).claim(user_id, card_id)
+        conn = sqlite3.connect(self.db.db_path, timeout=15)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            from systems.card_upgrade_system import CardUpgradeSystem
+            if CardUpgradeSystem(self.db)._active_match(conn, user_id):
+                conn.rollback(); return {"ok": False, "error_code": "active_match", "error": "تا پایان مسابقه پاداش ارتقای کارت را دریافت نکن"}
+            row = conn.execute(
+                """
+                SELECT pm.completed, pm.reward_claimed, c.name,
+                       COALESCE(pc.rarity_override,c.rarity) AS rarity
+                FROM player_card_missions pm
+                JOIN player_cards pc ON pc.user_id=pm.user_id AND pc.card_id=pm.card_id
+                JOIN cards c ON c.card_id=pm.card_id
+                WHERE pm.user_id=? AND pm.card_id=? AND c.origin='official'
+                """,
+                (user_id, card_id),
+            ).fetchone()
+            if not row:
+                conn.rollback(); return {"ok": False, "error_code": "mission_not_found", "error": "ماموریت پیدا نشد"}
+            if not row["completed"]:
+                conn.rollback(); return {"ok": False, "error_code": "mission_incomplete", "error": "ماموریت هنوز کامل نشده است"}
+            if row["reward_claimed"]:
+                conn.rollback(); return {"ok": False, "error_code": "reward_claimed", "error": "پاداش قبلاً دریافت شده است"}
+            if row["rarity"] != "epic":
+                conn.rollback(); return {"ok": False, "error_code": "epic_required", "error": "این پاداش فقط برای نسخه Epic قابل دریافت است"}
+            if not conn.execute("SELECT 1 FROM card_variants WHERE card_id=? AND rarity='legend'", (card_id,)).fetchone():
+                conn.rollback(); return {"ok": False, "error_code": "variant_unavailable", "error": "نسخه Legend این کارت آماده نیست"}
+            if not CardInventorySystem.consume_in(conn, user_id, card_id, "epic"):
+                conn.rollback(); return {"ok": False, "error_code": "epic_required", "error": "نسخه Epic موجود نیست"}
+            CardInventorySystem.grant_in(conn, user_id, card_id, "legend")
+            CardInventorySystem.reconcile_active_in(conn, user_id, card_id)
+            conn.execute("UPDATE player_card_missions SET reward_claimed=1,reward_claimed_at=? WHERE user_id=? AND card_id=? AND reward_claimed=0", (datetime.now().isoformat(), user_id, card_id))
+            conn.execute("INSERT OR IGNORE INTO player_progression(user_id,level,total_xp,tier_points,current_tier,last_played_at) VALUES (?,1,0,0,'Bronze',CURRENT_TIMESTAMP)", (user_id,))
+            old_level, old_xp = conn.execute(
+                "SELECT level,total_xp FROM player_progression WHERE user_id=?", (user_id,)
+            ).fetchone()
+            xp = int(old_xp or 0) + 30
+            new_level = LevelSystem.get_level_from_xp(xp)
+            conn.execute("UPDATE player_progression SET total_xp=?,level=? WHERE user_id=?", (xp, new_level, user_id))
+            from systems.level_rewards_system import LevelRewardsSystem
+            LevelRewardsSystem.grant_crossed_in(conn, user_id, int(old_level or 1), new_level)
+            conn.commit()
+            return {"ok": True, "card_id": card_id, "card_name": row["name"], "xp_gained": 30}
+        except Exception:
+            conn.rollback(); return {"ok": False, "error_code": "mission_claim_failed", "error": "دریافت پاداش انجام نشد"}
+        finally:
+            conn.close()
+
+    def skins(self, user_id: int, card_id: str) -> Dict[str, Any]:
+        conn = sqlite3.connect(self.db.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            owned = conn.execute("SELECT 1 FROM player_cards WHERE user_id=? AND card_id=?", (user_id, card_id)).fetchone()
+            if not owned:
+                return {"ok": False, "error_code": "card_not_owned", "error": "کارت در کلکسیون شما نیست"}
+            active = conn.execute("SELECT skin_id FROM active_skins WHERE user_id=? AND card_id=?", (user_id, card_id)).fetchone()
+            rows = conn.execute(
+                """
+                SELECT s.*, CASE WHEN ps.skin_id IS NULL THEN 0 ELSE 1 END AS unlocked
+                FROM skins s LEFT JOIN player_skins ps ON ps.skin_id=s.skin_id AND ps.user_id=?
+                WHERE s.card_id=? ORDER BY s.price,s.name
+                """,
+                (user_id, card_id),
+            ).fetchall()
+            return {"ok": True, "active_skin_id": active[0] if active else None, "skins": [dict(row) for row in rows]}
+        finally:
+            conn.close()
+
+    def purchase_skin(self, user_id: int, card_id: str, skin_id: str) -> Dict[str, Any]:
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            return {"ok":False,"error_code":"quote_required","error":"پیش‌نمایش قیمت و تأیید خرید لازم است"}
+        conn = sqlite3.connect(self.db.db_path, timeout=15)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT s.price,p.coins FROM skins s JOIN players p ON p.user_id=?
+                JOIN player_cards pc ON pc.user_id=p.user_id AND pc.card_id=s.card_id
+                WHERE s.skin_id=? AND s.card_id=?
+                """, (user_id, skin_id, card_id),
+            ).fetchone()
+            if not row:
+                conn.rollback(); return {"ok": False, "error_code": "skin_not_accessible", "error": "پوسته برای این کارت در دسترس نیست"}
+            if row["price"] < 0:
+                conn.rollback(); return {"ok": False, "error_code": "invalid_price", "error": "قیمت پوسته نامعتبر است"}
+            if conn.execute("SELECT 1 FROM player_skins WHERE user_id=? AND skin_id=?", (user_id, skin_id)).fetchone():
+                conn.rollback(); return {"ok": False, "error_code": "already_owned", "error": "این پوسته را قبلاً گرفته‌ای"}
+            if row["coins"] < row["price"]:
+                conn.rollback(); return {"ok": False, "error_code": "insufficient_coins", "error": "سکه کافی نیست"}
+            conn.execute("UPDATE players SET coins=coins-? WHERE user_id=? AND coins>=?", (row["price"], user_id, row["price"]))
+            conn.execute("INSERT INTO player_skins(user_id,skin_id,unlocked_at) VALUES (?,?,?)", (user_id, skin_id, datetime.now().isoformat()))
+            conn.commit(); return {"ok": True, "skin_id": skin_id, "coins_spent": row["price"], "coins": row["coins"] - row["price"]}
+        except Exception:
+            conn.rollback(); return {"ok": False, "error_code": "skin_purchase_failed", "error": "خرید پوسته انجام نشد"}
+        finally:
+            conn.close()
+
+    def activate_skin(self, user_id: int, card_id: str, skin_id: str | None) -> Dict[str, Any]:
+        conn = sqlite3.connect(self.db.db_path, timeout=15)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute("SELECT 1 FROM player_cards WHERE user_id=? AND card_id=?", (user_id, card_id)).fetchone():
+                conn.rollback(); return {"ok": False, "error_code": "card_not_owned", "error": "کارت در کلکسیون شما نیست"}
+            if skin_id and not conn.execute("SELECT 1 FROM skins s JOIN player_skins ps ON ps.skin_id=s.skin_id WHERE ps.user_id=? AND s.card_id=? AND s.skin_id=?", (user_id, card_id, skin_id)).fetchone():
+                conn.rollback(); return {"ok": False, "error_code": "skin_not_owned", "error": "این پوسته را برای کارت انتخاب‌شده نداری"}
+            if skin_id:
+                conn.execute("INSERT OR REPLACE INTO active_skins(user_id,card_id,skin_id) VALUES (?,?,?)", (user_id, card_id, skin_id))
+            else:
+                conn.execute("DELETE FROM active_skins WHERE user_id=? AND card_id=?", (user_id, card_id))
+            conn.commit(); return {"ok": True, "card_id": card_id, "skin_id": skin_id}
+        except Exception:
+            conn.rollback(); return {"ok": False, "error_code": "skin_activation_failed", "error": "فعال‌سازی پوسته انجام نشد"}
+        finally:
+            conn.close()

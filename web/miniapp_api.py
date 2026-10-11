@@ -1,0 +1,1747 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+TelBattle Mini App — Flask REST API
+"""
+
+import json
+import hmac
+import hashlib
+import os
+import sys
+import random
+import sqlite3
+import logging
+from contextlib import closing
+from io import BytesIO
+from functools import lru_cache
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, parse_qsl, quote
+from functools import wraps
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from flask import Flask, request, jsonify, send_from_directory, send_file, g
+from PIL import Image, ImageOps
+from werkzeug.middleware.proxy_fix import ProxyFix
+from game_core import DatabaseManager, CardRarity
+from systems.ai_opponent import AsoAI, DAILY_SOLO_LIMIT
+from systems.battle_system_3rounds import BattleSystem3Rounds, ARENAS
+from systems.arena_registry import ArenaRegistry
+from systems.game_mode_system import GameModeSystem
+from systems.mini_three_round_system import MiniThreeRoundSystem, MODE as MINI_THREE_ROUND_MODE
+from systems.three_round_abilities import (
+    SOLO_ABILITY_FIELD, ability_definition, available_abilities, consume_ability, select_arena,
+)
+from systems.player_hub_system import PlayerHubSystem
+from systems.shared_foundation import eligible_cards
+from systems.card_upgrade_system import CardUpgradeSystem
+from systems.deck_system import DeckSystem
+from systems.player_rewards_system import PlayerRewardsSystem
+from systems.fusion_system import FusionSystem
+
+logger = logging.getLogger(__name__)
+
+# ==================== تنظیمات ====================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+MINIAPP_DIST_DIR = os.environ.get(
+    "MINIAPP_DIST_DIR",
+    os.path.join(PROJECT_ROOT, "frontend", "game", "dist"),
+)
+# Dynamic Arena backgrounds must survive a Vite rebuild.  The asset route below
+# checks this durable directory first, then falls back to the bundled `dist`
+# backgrounds that ship with the Mini App.
+ARENA_MEDIA_DIR = os.environ.get(
+    "MINIAPP_ARENA_MEDIA_DIR",
+    os.path.join(PROJECT_ROOT, "media", "arena-backgrounds"),
+)
+CARD_IMAGES_DIR = os.environ.get(
+    "CARD_IMAGES_DIR",
+    os.path.join(PROJECT_ROOT, "assets", "card_images"),
+)
+DB_PATH = os.environ.get("DATABASE_PATH", "game_bot.db")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+TELEGRAM_INIT_DATA_MAX_AGE_SECONDS = max(
+    60,
+    int(os.environ.get("TELEGRAM_INIT_DATA_MAX_AGE_SECONDS", "86400")),
+)
+
+# fallback به config.json اگه env نبود
+if not BOT_TOKEN:
+    try:
+        with open("config.json") as f:
+            _cfg = json.load(f)
+            BOT_TOKEN = _cfg.get("bot_token", "")
+    except Exception:
+        pass
+if not BOT_TOKEN:
+    try:
+        with open("game_config.json") as f:
+            _cfg = json.load(f)
+            BOT_TOKEN = _cfg.get("bot_settings", {}).get("token", "")
+    except Exception:
+        pass
+
+app = Flask(__name__, static_folder=None)
+# Production traffic reaches Flask through one trusted local Nginx proxy.
+# Respect its forwarded host/scheme so generated invite links stay HTTPS.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+db = DatabaseManager(DB_PATH)
+battle_system = BattleSystem3Rounds(db)
+quick_modes = GameModeSystem(db)
+arena_registry = ArenaRegistry(db)
+mini_three_round = MiniThreeRoundSystem(db, quick_modes, arena_registry, battle_system)
+
+# ==================== احراز هویت ====================
+
+def verify_telegram_init_data(init_data: str):
+    """
+    بررسی صحت initData تلگرام.
+    https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+    برگشت: دیکشنری user یا None
+    """
+    try:
+        if not init_data or not BOT_TOKEN:
+            return None
+
+        # Split the original query string before decoding individual values.
+        # Telegram now includes photo_url for all Mini Apps; decoding the whole
+        # string first turns an encoded '&' inside that URL into a fake field and
+        # invalidates the otherwise-correct signature.
+        pairs = parse_qsl(init_data, keep_blank_values=True)
+        parsed = {}
+        for key, value in pairs:
+            # Duplicate signed fields are ambiguous and should never be trusted.
+            if key in parsed:
+                return None
+            parsed[key] = value
+
+        hash_value = parsed.pop("hash", "")
+        if not hash_value:
+            return None
+        data_check_string = "\n".join(
+            f"{key}={value}" for key, value in sorted(parsed.items())
+        )
+
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(expected_hash, hash_value):
+            return None
+
+        auth_date = int(parsed.get("auth_date", "0"))
+        now = int(datetime.now(timezone.utc).timestamp())
+        if auth_date <= 0 or auth_date > now + 60:
+            return None
+        if now - auth_date > TELEGRAM_INIT_DATA_MAX_AGE_SECONDS:
+            return None
+
+        user = json.loads(parsed.get("user", "{}"))
+        if not isinstance(user, dict) or not user.get("id"):
+            return None
+        user["id"] = int(user["id"])
+        return user
+    except Exception as e:
+        logger.warning(f"initData verification failed: {e}")
+        return None
+
+
+def require_auth(f):
+    """دکوراتور: بررسی احراز هویت از Authorization header"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+
+        # اگه initData داره، همیشه verify کن
+        if auth_header.startswith("tma "):
+            init_data = auth_header[4:]
+            if not BOT_TOKEN:
+                logger.error("BOT_TOKEN is missing; Mini App authentication is unavailable")
+                return jsonify({
+                    "error": "سرویس ورود موقتاً در دسترس نیست",
+                    "error_code": "auth_not_configured",
+                }), 503
+            user = verify_telegram_init_data(init_data)
+            if user:
+                g.user_id = user["id"]
+                player = db.get_or_create_player(
+                    user_id=user["id"],
+                    username=user.get("username", ""),
+                    first_name=user.get("first_name", "")
+                )
+                _grant_starter_cards(user["id"])
+                return f(*args, **kwargs)
+            # initData invalid — اگه debug mode، ادامه بده
+            if not (app.debug or os.environ.get("FLASK_DEBUG", "0") == "1"):
+                logger.warning("Rejected invalid Telegram Mini App initData")
+                return jsonify({
+                    "error": "ورود تلگرام معتبر نیست؛ مینی‌اپ را از داخل ربات دوباره باز کن",
+                    "error_code": "invalid_init_data",
+                }), 401
+
+        # Debug mode: بدون auth یا با initData ناموفق
+        if app.debug or os.environ.get("FLASK_DEBUG", "0") == "1":
+            # سعی کن از initData user_id بگیر
+            if auth_header.startswith("tma "):
+                try:
+                    from urllib.parse import parse_qs, unquote
+                    parsed = parse_qs(unquote(auth_header[4:]))
+                    user_str = parsed.get("user", ["{}"])[0]
+                    import json as _json
+                    user_data = _json.loads(user_str)
+                    if user_data.get("id"):
+                        g.user_id = int(user_data["id"])
+                        db.get_or_create_player(
+                            user_id=g.user_id,
+                            username=user_data.get("username", ""),
+                            first_name=user_data.get("first_name", "")
+                        )
+                        _grant_starter_cards(g.user_id)
+                        return f(*args, **kwargs)
+                except Exception:
+                    pass
+            # fallback به X-Debug-User-Id
+            debug_user = request.headers.get("X-Debug-User-Id", "1")
+            g.user_id = int(debug_user)
+            db.get_or_create_player(user_id=g.user_id)
+            _grant_starter_cards(g.user_id)
+            return f(*args, **kwargs)
+
+        return jsonify({
+            "error": "مینی‌اپ را از دکمه داخل ربات باز کن",
+            "error_code": "auth_required",
+        }), 401
+    return decorated
+
+
+def _grant_starter_cards(user_id: int):
+    """اگه player هیچ کارتی نداره، ۳ تا کارت starter بده"""
+    try:
+        from systems.starter_cards_system import grant_starter_cards
+        grant_starter_cards(db, user_id)
+    except Exception as e:
+        logger.warning(f"Failed to grant starter cards to {user_id}: {e}")
+
+
+# ==================== Helper ====================
+
+def card_to_dict(card) -> dict:
+    """تبدیل Card object به دیکشنری برای JSON"""
+    try:
+        abilities = json.loads(card.abilities) if isinstance(card.abilities, str) else (card.abilities or [])
+    except Exception:
+        abilities = []
+    image_path = getattr(card, "image_path", "") or ""
+    image_name = os.path.basename(str(image_path).replace("\\", "/"))
+    return {
+        "card_id": card.card_id,
+        "origin":card.origin,
+        "name": card.name,
+        "rarity": card.rarity.value if hasattr(card.rarity, 'value') else card.rarity,
+        "power": card.power,
+        "speed": card.speed,
+        "iq": card.iq,
+        "popularity": card.popularity,
+        "card_type": card.card_type,
+        "abilities": abilities,
+        "biography": card.biography or "",
+        "image_url": (f"/api/v1/custom/cards/{quote(card.card_id)}/image" if card.origin=="custom" else f"/card-images/{quote(image_name)}?w=480" if image_name else ""),
+        "score": card.power + card.speed + card.iq + card.popularity,
+    }
+
+
+def _player_hub() -> PlayerHubSystem:
+    # Construct on demand so tests and maintenance scripts can safely replace db.
+    return PlayerHubSystem(db)
+
+
+def _card_upgrades() -> CardUpgradeSystem:
+    return CardUpgradeSystem(db)
+
+
+def _decks() -> DeckSystem:
+    return DeckSystem(db)
+
+
+def _rewards() -> PlayerRewardsSystem:
+    return PlayerRewardsSystem(db)
+
+
+def _fusion() -> FusionSystem:
+    return FusionSystem(db)
+
+
+def _inventory():
+    from systems.card_inventory_system import CardInventorySystem
+    return CardInventorySystem(db)
+
+
+def _skin_payload(skin: dict) -> dict:
+    result = dict(skin)
+    image_name = os.path.basename(str(result.get("image_path", "")).replace("\\", "/"))
+    result["image_url"] = f"/card-images/{quote(image_name)}?w=480" if image_name else ""
+    return result
+
+
+def _deck_payload(deck: dict) -> dict:
+    synergy = GameModeSystem(db).calculate_deck_synergy([card.card_id for card in deck.get("cards", [])])
+    return {
+        "deck_id": deck["deck_id"],
+        "deck_name": deck["deck_name"],
+        "is_valid": bool(deck["is_valid"]),
+        "invalid_reason": deck.get('invalid_reason',''),
+        "total_points": deck["total_points"],
+        "synergy": synergy,
+        "cards": [card_to_dict(card) for card in deck.get("cards", [])],
+    }
+
+
+def _management_locked():
+    if _card_upgrades().is_management_locked(g.user_id):
+        return jsonify({"error": "تا پایان مسابقه امکان مدیریت مجموعه وجود ندارد", "error_code": "active_match"}), 409
+    return None
+
+
+@app.route("/api/v1/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
+# ==================== Routes: Static ====================
+
+@app.route("/")
+@app.route("/miniapp")
+def serve_miniapp():
+    index_path = os.path.join(MINIAPP_DIST_DIR, "index.html")
+    if not os.path.isfile(index_path):
+        return jsonify({
+            "error": "Mini App build not found",
+            "hint": "Run npm install && npm run build in frontend/game",
+        }), 503
+    return send_from_directory(MINIAPP_DIST_DIR, "index.html")
+
+
+@app.route("/miniapp-assets/<path:filename>")
+def serve_miniapp_asset(filename):
+    if filename.startswith("arena-backgrounds/"):
+        dynamic_filename = filename.split("/", 1)[1]
+        dynamic_path = os.path.join(ARENA_MEDIA_DIR, dynamic_filename)
+        if os.path.isfile(dynamic_path):
+            return send_from_directory(ARENA_MEDIA_DIR, dynamic_filename)
+    return send_from_directory(MINIAPP_DIST_DIR, filename)
+
+
+@app.route("/card-images/<path:filename>")
+def serve_card_image(filename):
+    safe_name = os.path.basename(filename)
+    if safe_name != filename:
+        return jsonify({"error": "Invalid image path"}), 404
+    try:
+        width = max(160, min(int(request.args.get("w", 480)), 960))
+    except (TypeError, ValueError):
+        width = 480
+    try:
+        encoded = _optimized_card_image(safe_name, width)
+        return send_file(
+            BytesIO(encoded),
+            mimetype="image/webp",
+            max_age=86400,
+            download_name=f"{os.path.splitext(safe_name)[0]}.webp",
+        )
+    except (FileNotFoundError, OSError):
+        return send_from_directory(CARD_IMAGES_DIR, safe_name)
+
+
+@lru_cache(maxsize=192)
+def _optimized_card_image(filename: str, width: int) -> bytes:
+    source = os.path.join(CARD_IMAGES_DIR, filename)
+    if not os.path.isfile(source):
+        raise FileNotFoundError(source)
+    with Image.open(source) as raw:
+        image = ImageOps.exif_transpose(raw).convert("RGB")
+        if image.width > width:
+            height = max(1, round(image.height * width / image.width))
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
+        output = BytesIO()
+        image.save(output, format="WEBP", quality=82, method=5)
+        return output.getvalue()
+
+
+# ==================== Helpers: Quick Mode ====================
+
+QUICK_VARIANTS = {"normal", "random", "friendly", "friendly_random"}
+QUICK_ERROR_MESSAGES = {
+    "not_found": "درخواست پیدا نشد.",
+    "self_accept": "نمی‌توانی دعوت خودت را قبول کنی.",
+    "expired": "زمان درخواست تمام شد؛ درخواست منقضی شد.",
+    "accepted": "این دعوت قبلاً پذیرفته شده است.",
+    "already_claimed": "بازیکن دیگری زودتر این دعوت را پذیرفت.",
+    "choice_locked": "انتخاب قبلی ثبت شده و قابل تغییر نیست.",
+    "card_not_owned": "این کارت در مجموعه تو نیست.",
+    "invalid_phase_or_player": "این انتخاب در فاز فعلی معتبر نیست.",
+    "abilities_disabled": "در این میدان Ability غیرفعال است.",
+    "ability_not_owned": "این Ability را در موجودی نداری.",
+    "unknown_ability": "Ability نامعتبر است.",
+    "ability_not_supported": "این Ability در بازی سه‌راوندی قابل استفاده نیست؛ قفل ویژگی مربوط به Quick است.",
+    "ability_already_used": "در هر مسابقهٔ سه‌راوندی فقط یک بار می‌توانی Ability مصرف کنی.",
+    "no_alternative_arena": "زمین فعال دیگری برای تغییر وجود ندارد؛ Ability مصرف نشد.",
+    "invalid_round": "شمارهٔ راوند نامعتبر است.",
+    "round_changed": "راوند عوض شده است؛ وضعیت مسابقه را تازه کن.",
+    "stat_not_allowed": "این ویژگی در میدان فعلی قابل انتخاب نیست.",
+    "match_not_ready": "مسابقه هنوز آماده نیست یا به پایان رسیده است.",
+    "deadline_passed": "مهلت انتخاب به پایان رسیده است.",
+}
+
+
+def _quick_error(reason: str, status: int = 400):
+    return jsonify({"error": QUICK_ERROR_MESSAGES.get(reason, reason), "reason": reason}), status
+
+
+def _mode_access_error(mode: str, user_id: int):
+    allowed, reason = quick_modes.mode_access.check(user_id, mode)
+    return None if allowed else (jsonify({"error": reason, "reason": "mode_locked"}), 403)
+
+
+def _expire_waiting_request(game_request: dict) -> dict:
+    if game_request.get("status") != "waiting":
+        return game_request
+    try:
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        expired = datetime.fromisoformat(game_request["expires_at"]) <= now_utc
+    except (KeyError, TypeError, ValueError):
+        expired = False
+    if expired:
+        quick_modes.expire_request(game_request["request_id"])
+        return quick_modes.get_request(game_request["request_id"]) or game_request
+    return game_request
+
+
+def _quick_request_for_user(request_id: str, user_id: int):
+    game_request = quick_modes.get_request(request_id)
+    if not game_request:
+        return None
+    game_request = _expire_waiting_request(game_request)
+    participants = {game_request.get("creator_id"), game_request.get("opponent_id")}
+    return game_request if game_request["mode"] == "quick" and user_id in participants else None
+
+
+def _settle_quick_deadline(request_id: str, state: dict) -> dict:
+    if state.get("phase") == "completed" or not state.get("deadline"):
+        return state
+    try:
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        deadline_passed = datetime.fromisoformat(state["deadline"]) <= now_utc
+    except (TypeError, ValueError):
+        deadline_passed = False
+    if not deadline_passed:
+        return state
+    phase = state.get("phase")
+    if phase == "ability_selection":
+        for player_id in state.get("players", []):
+            latest = quick_modes.get_state(request_id) or state
+            if latest.get("phase") != "ability_selection":
+                break
+            if str(player_id) not in latest.get("ability_choices", {}):
+                try:
+                    quick_modes.select_quick_ability(request_id, player_id, "skip")
+                except ValueError:
+                    pass
+        return quick_modes.get_state(request_id) or state
+    choice_key = "cards" if phase == "card_selection" else "stat_choices"
+    missing = [
+        player_id for player_id in state.get("players", [])
+        if str(player_id) not in state.get(choice_key, {})
+    ]
+    if missing:
+        try:
+            quick_modes.forfeit_quick(request_id, missing, reason=f"{phase}_timeout")
+        except ValueError:
+            pass
+    return quick_modes.get_state(request_id) or state
+
+
+def _quick_snapshot(game_request: dict, user_id: int) -> dict:
+    """Return a player-scoped state without leaking the opponent's hidden choices."""
+    request_id = game_request["request_id"]
+    state = quick_modes.get_state(request_id)
+    if game_request["status"] in ("accepted", "active") and state is None:
+        state = quick_modes.start_quick_match(request_id)
+    if state:
+        state = _settle_quick_deadline(request_id, state)
+        game_request = quick_modes.get_request(request_id) or game_request
+
+    response = {
+        "request_id": request_id,
+        "user_id": user_id,
+        "status": game_request["status"],
+        "source": game_request["source"],
+        "variant": game_request["variant"],
+        "expires_at": game_request["expires_at"],
+        "opponent_id": (
+            game_request.get("opponent_id")
+            if game_request.get("creator_id") == user_id
+            else game_request.get("creator_id")
+        ),
+    }
+    if game_request["status"] == "expired":
+        response["message"] = "زمان درخواست تمام شد؛ درخواست منقضی شد."
+    if not state:
+        return response
+
+    user_key = str(user_id)
+    opponent_id = next((pid for pid in state.get("players", []) if pid != user_id), None)
+    opponent_key = str(opponent_id) if opponent_id is not None else ""
+    arena = quick_modes.arena_for_state(state) if state.get("arena") else None
+    own_card_id = state.get("cards", {}).get(user_key)
+    from systems.custom_cards import match_card
+    own_card = match_card(db,request_id,user_id,own_card_id) if own_card_id else None
+    reveal_opponent = (
+        state.get("phase") == "completed"
+        or (
+            state.get("phase") == "stat_selection"
+            and state.get("ability_choices", {}).get(user_key) == "reveal_opponent"
+        )
+    )
+    opponent_card_id = state.get("cards", {}).get(opponent_key) if reveal_opponent else None
+    opponent_card = match_card(db,request_id,opponent_id,opponent_card_id) if opponent_card_id else None
+    preview = None
+    if own_card and opponent_key in state.get("cards", {}):
+        try:
+            preview = quick_modes.quick_stat_preview(state, user_id)
+        except ValueError:
+            preview = None
+    response.update({
+        "phase": state.get("phase"),
+        "scoring_rule": state.get("scoring_rule"),
+        "deadline": state.get("deadline"),
+        "arena": arena,
+        "my_card": card_to_dict(own_card) if own_card else None,
+        "my_final_values": preview.get("final_values") if preview else None,
+        "my_arena_effects": preview.get("arena_effects", []) if preview else [],
+        "my_card_locked": own_card_id is not None,
+        "opponent_card_selected": opponent_key in state.get("cards", {}),
+        "opponent_card": card_to_dict(opponent_card) if opponent_card else None,
+        "my_ability": state.get("ability_choices", {}).get(user_key),
+        "my_ability_locked": user_key in state.get("ability_choices", {}),
+        "opponent_ability_selected": opponent_key in state.get("ability_choices", {}),
+        "my_stat": state.get("stat_choices", {}).get(user_key),
+        "my_stat_locked": user_key in state.get("stat_choices", {}),
+        "opponent_stat_selected": opponent_key in state.get("stat_choices", {}),
+        "allowed_stats": quick_modes.allowed_quick_stats(state, user_id)
+            if state.get("phase") == "stat_selection" else [],
+        "abilities": quick_modes.list_player_abilities(user_id)
+            if state.get("phase") == "ability_selection" and arena and arena.get("abilities_enabled", True)
+            else [],
+        "report": state.get("report") if state.get("phase") == "completed" else None,
+    })
+    return response
+
+
+# ==================== Routes: Profile ====================
+
+@app.route("/api/v1/profile", methods=["GET"])
+@require_auth
+def get_profile():
+    return _player_hub_overview_response()
+
+
+def _player_hub_overview_response():
+    overview = _player_hub().get_overview(g.user_id)
+    best_card_id = overview.pop("best_card_id", None)
+    best_card = db.get_card_by_id_for_player(best_card_id, g.user_id) if best_card_id else None
+    overview["best_card"] = card_to_dict(best_card) if best_card else None
+    return jsonify(overview)
+
+
+@app.route("/api/v1/player-hub/overview", methods=["GET"])
+@require_auth
+def get_player_hub_overview():
+    return _player_hub_overview_response()
+
+
+# ==================== Routes: Cards ====================
+
+@app.route('/api/v1/custom/settings')
+@require_auth
+def custom_settings():
+    from systems.shared_foundation import settings_in
+    from systems.progression_config import enabled_in
+    with sqlite3.connect(db.db_path) as conn:
+        flags=settings_in(conn)
+        contact=conn.execute("SELECT value_json FROM foundation_settings WHERE key='custom_admin_contact'").fetchone()
+        orders=conn.execute("SELECT value_json FROM foundation_settings WHERE key='custom_card_orders_enabled'").fetchone()
+        return jsonify(custom_cards_enabled=flags['custom_cards_enabled'],quick_friendly_enabled=flags['quick_friendly_enabled'] and enabled_in(conn),easy_custom_cards_enabled=flags['easy_custom_cards_enabled'],order_contact=json.loads(contact[0]) if orders and json.loads(orders[0]) and contact else None)
+
+
+@app.route('/api/v1/custom/cards/<card_id>/image')
+@require_auth
+def custom_card_image(card_id):
+    from systems.custom_cards import access_in,media_root
+    from flask import send_file
+    with sqlite3.connect(db.db_path) as conn:
+        if not access_in(conn,g.user_id,card_id):return jsonify(error='not_found'),404
+        row=conn.execute('SELECT m.filename FROM custom_definitions d JOIN custom_media m USING(media_id) WHERE d.card_id=? AND m.removed=0',(card_id,)).fetchone()
+    if not row:return jsonify(error='not_found'),404
+    response=send_file(media_root(db)/row[0],mimetype='image/png',max_age=0)
+    response.headers['Cache-Control']='private, no-store'
+    response.headers['X-Content-Type-Options']='nosniff'
+    return response
+
+@app.route("/api/v1/cards", methods=["GET"])
+@require_auth
+def get_cards():
+    user_id = g.user_id
+    rarity_filter = request.args.get("rarity", "all")
+    try:
+        page = int(request.args.get("page", 1))
+        limit = int(request.args.get("limit", 20))
+    except (TypeError, ValueError):
+        return jsonify({"error": "پارامتر صفحه نامعتبر است", "error_code": "invalid_pagination"}), 400
+    match_key=request.args.get("match_key")
+    if match_key:
+        game_request=quick_modes.get_request(match_key)
+        if not game_request or user_id not in (game_request["creator_id"],game_request.get("opponent_id")):return _quick_error("not_found",404)
+    cards, total, page, limit = _player_hub().get_cards(
+        user_id,
+        page=page,
+        limit=limit,
+        rarity=rarity_filter,
+        sort=request.args.get("sort", "rarity"),
+        query=request.args.get("query", ""),
+        match_key=match_key,
+    )
+
+    result = []
+    for card in cards:
+        cd = db.is_card_in_cooldown(user_id, card.card_id) if hasattr(db, 'is_card_in_cooldown') else False
+        d = card_to_dict(card)
+        d["is_in_cooldown"] = bool(cd)
+        d["inventory"] = _inventory().counts(user_id, card.card_id)
+        result.append(d)
+
+    return jsonify({
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "page_count": max(1, (total + limit - 1) // limit),
+        "cards": result,
+    })
+
+
+@app.route("/api/v1/cards/<card_id>", methods=["GET"])
+@require_auth
+def get_card_detail(card_id):
+    card = _player_hub().get_owned_card(g.user_id, card_id)
+    if not card:
+        return jsonify({"error": "کارت در کلکسیون شما نیست", "error_code": "card_not_owned"}), 404
+    result = card_to_dict(card)
+    cooldown = db.is_card_in_cooldown(g.user_id, card.card_id) if hasattr(db, "is_card_in_cooldown") else False
+    result["is_in_cooldown"] = bool(cooldown)
+    result["upgrade"] = _card_upgrades().preview(g.user_id, card_id)
+    result["inventory"] = _inventory().counts(g.user_id, card_id)
+    return jsonify(result)
+
+
+@app.route("/api/v1/cards/<card_id>/active-form", methods=["POST"])
+@require_auth
+def activate_card_form(card_id):
+    data = request.get_json(silent=True) or {}
+    result = _inventory().activate(g.user_id, card_id, str(data.get("rarity", "")))
+    if not result["ok"]:
+        return jsonify(result), 409
+    card = db.get_card_by_id_for_player(card_id, g.user_id)
+    payload = card_to_dict(card)
+    payload["inventory"] = _inventory().counts(g.user_id, card_id)
+    payload["upgrade"] = _card_upgrades().preview(g.user_id, card_id)
+    return jsonify({"ok": True, "card": payload})
+
+
+@app.route("/api/v1/cards/<card_id>/fuse-copies/preview", methods=["GET"])
+@require_auth
+def preview_identical_fusion(card_id):
+    return jsonify(_fusion().preview_identical(g.user_id, card_id, request.args.get("target", "epic")))
+
+
+@app.route("/api/v1/cards/<card_id>/fuse-copies", methods=["POST"])
+@require_auth
+def execute_identical_fusion(card_id):
+    data = request.get_json(silent=True) or {}
+    target = str(data.get("target", "epic"))
+    result = _fusion().fuse_identical(g.user_id, card_id, target, data.get("request_key"))
+    if not result.success:
+        return jsonify({"ok": False, "error_code": result.error_code or "fusion_failed", "error": result.error}), 409
+    card = db.get_card_by_id_for_player(card_id, g.user_id)
+    payload = card_to_dict(card)
+    payload["inventory"] = _inventory().counts(g.user_id, card_id)
+    payload["upgrade"] = _card_upgrades().preview(g.user_id, card_id)
+    return jsonify({"ok": True, "card": payload, "xp_gained": result.xp_gained,
+                    "old_level": result.old_level, "new_level": result.new_level,
+                    "replayed": result.replayed,
+                    "profile": _player_hub().get_overview(g.user_id)})
+
+
+@app.route("/api/v1/cards/<card_id>/upgrade/preview", methods=["POST"])
+@require_auth
+def preview_card_upgrade(card_id):
+    result = _card_upgrades().preview(g.user_id, card_id)
+    return jsonify(result), 200 if result.get("ok") else 409
+
+
+@app.route("/api/v1/cards/<card_id>/upgrade", methods=["POST"])
+@require_auth
+def upgrade_card(card_id):
+    data = request.get_json(silent=True) or {}
+    result = _card_upgrades().upgrade(g.user_id, card_id, str(data.get("upgrade_key", "")),
+                                      data.get("request_key"))
+    if not result.get("ok"):
+        status = 404 if result.get("error_code") == "card_not_owned" else 409
+        return jsonify(result), status
+    card = db.get_card_by_id_for_player(card_id, g.user_id)
+    return jsonify({
+        "ok": True,
+        "message": "کارت با موفقیت ارتقا پیدا کرد",
+        "profile": _player_hub().get_overview(g.user_id),
+        "data": {"upgrade": result, "card": card_to_dict(card)},
+    })
+
+
+# ==================== Routes: Deck management ====================
+
+@app.route("/api/v1/decks", methods=["GET"])
+@require_auth
+def get_decks():
+    return jsonify({"decks": [_deck_payload(deck) for deck in _decks().get_player_decks(g.user_id)]})
+
+
+@app.route("/api/v1/decks", methods=["POST"])
+@require_auth
+def create_deck():
+    locked = _management_locked()
+    if locked:
+        return locked
+    data = request.get_json(silent=True) or {}
+    card_ids = data.get("card_ids") if isinstance(data.get("card_ids"), list) else []
+    ok, value = _decks().create_deck(g.user_id, [str(item) for item in card_ids], str(data.get("name", "")).strip() or None)
+    if not ok:
+        return jsonify({"error": value, "error_code": "invalid_deck"}), 400
+    deck = next(item for item in _decks().get_player_decks(g.user_id) if item["deck_id"] == value)
+    return jsonify({"ok": True, "message": "دک ساخته شد", "data": _deck_payload(deck)}), 201
+
+
+@app.route("/api/v1/decks/<deck_id>", methods=["PUT"])
+@require_auth
+def update_deck(deck_id):
+    locked = _management_locked()
+    if locked:
+        return locked
+    data = request.get_json(silent=True) or {}
+    card_ids = data.get("card_ids")
+    normalized = [str(item) for item in card_ids] if isinstance(card_ids, list) else None
+    name = str(data["name"]).strip() if "name" in data else None
+    ok, error = _decks().update_deck(g.user_id, deck_id, normalized, name)
+    if not ok:
+        status = 404 if error == "دک یافت نشد." else 403 if error == "این دک متعلق به شما نیست." else 400
+        return jsonify({"error": error, "error_code": "invalid_deck"}), status
+    deck = next(item for item in _decks().get_player_decks(g.user_id) if item["deck_id"] == deck_id)
+    return jsonify({"ok": True, "message": "دک بروزرسانی شد", "data": _deck_payload(deck)})
+
+
+@app.route("/api/v1/decks/<deck_id>", methods=["DELETE"])
+@require_auth
+def delete_deck(deck_id):
+    locked = _management_locked()
+    if locked:
+        return locked
+    ok, error = _decks().delete_deck(g.user_id, deck_id)
+    if not ok:
+        status = 404 if error == "دک یافت نشد." else 403
+        return jsonify({"error": error, "error_code": "deck_not_accessible"}), status
+    return jsonify({"ok": True, "message": "دک حذف شد", "data": {"deck_id": deck_id}})
+
+
+# ==================== Routes: Rewards and skins ====================
+
+@app.route("/api/v1/claim", methods=["GET"])
+@require_auth
+def get_claim_status():
+    return jsonify(_rewards().claim_status(g.user_id))
+
+
+@app.route("/api/v1/claim", methods=["POST"])
+@require_auth
+def claim_daily_card():
+    locked = _management_locked()
+    if locked:
+        return locked
+    result = _rewards().claim_daily(g.user_id)
+    if not result.get("ok"):
+        return jsonify(result), 409
+    card = db.get_card_by_id(result["card_id"]) if result.get("card_id") else None
+    return jsonify({"ok": True, "message": "پاداش روزانه و یک Ability دریافت شد", "data": {"card": card_to_dict(card) if card else None, "reward_type": result.get("reward_type","card"), "ability": result["ability"], "quantity": result["quantity"]}, "profile": _player_hub().get_overview(g.user_id)})
+
+
+@app.route("/api/v1/missions", methods=["GET"])
+@require_auth
+def get_missions():
+    return jsonify({"missions": _rewards().missions(g.user_id)})
+
+
+@app.route("/api/v1/missions/<mission_id>/claim", methods=["POST"])
+@require_auth
+def claim_mission_reward(mission_id):
+    locked = _management_locked()
+    if locked:
+        return locked
+    result = _rewards().claim_mission(g.user_id, mission_id)
+    if not result.get("ok"):
+        return jsonify(result), 409
+    card = db.get_card_by_id_for_player(result["card_id"], g.user_id) if result.get("card_id") else None
+    return jsonify({"ok": True, "message": "پاداش مأموریت دریافت شد", "data": {"mission": result, "card": card_to_dict(card) if card else None}, "profile": _player_hub().get_overview(g.user_id)})
+
+
+@app.route("/api/v1/cards/<card_id>/skins", methods=["GET"])
+@require_auth
+def get_card_skins(card_id):
+    result = _rewards().skins(g.user_id, card_id)
+    if not result.get("ok"):
+        return jsonify(result), 404
+    result["skins"] = [_skin_payload(skin) for skin in result["skins"]]
+    return jsonify(result)
+
+
+@app.route("/api/v1/cards/<card_id>/skins/<skin_id>/purchase", methods=["POST"])
+@require_auth
+def purchase_card_skin(card_id, skin_id):
+    locked = _management_locked()
+    if locked:
+        return locked
+    result = _rewards().purchase_skin(g.user_id, card_id, skin_id)
+    if not result.get("ok"):
+        return jsonify(result), 409
+    return jsonify({"ok": True, "message": "پوسته خریداری شد", "data": result, "profile": _player_hub().get_overview(g.user_id)})
+
+
+@app.route("/api/v1/cards/<card_id>/skins/activate", methods=["POST"])
+@require_auth
+def activate_card_skin(card_id):
+    locked = _management_locked()
+    if locked:
+        return locked
+    data = request.get_json(silent=True) or {}
+    skin_id = str(data.get("skin_id")) if data.get("skin_id") else None
+    result = _rewards().activate_skin(g.user_id, card_id, skin_id)
+    if not result.get("ok"):
+        return jsonify(result), 409
+    return jsonify({"ok": True, "message": "ظاهر کارت بروزرسانی شد", "data": result})
+
+
+# ==================== Routes: Fusion ====================
+
+@app.route("/api/v1/fusions/preview", methods=["POST"])
+@require_auth
+def preview_fusion():
+    data = request.get_json(silent=True) or {}
+    card_ids = [str(item) for item in data.get("card_ids", [])] if isinstance(data.get("card_ids"), list) else []
+    result = _fusion().preview(g.user_id, card_ids, str(data.get("retained_card_id", "")), str(data.get("target_rarity", "")))
+    if not result.get("ok"):
+        return jsonify(result), 400
+    result["cards"] = [card_to_dict(card) for card in result["cards"]]
+    return jsonify(result)
+
+
+@app.route("/api/v1/fusions", methods=["POST"])
+@require_auth
+def execute_fusion():
+    data = request.get_json(silent=True) or {}
+    card_ids = [str(item) for item in data.get("card_ids", [])] if isinstance(data.get("card_ids"), list) else []
+    retained = str(data.get("retained_card_id", ""))
+    target = str(data.get("target_rarity", ""))
+    request_key = data.get("request_key")
+    result = _fusion().fuse_to_epic(g.user_id, card_ids, retained, request_key) if target == "epic" else _fusion().fuse_to_legend(g.user_id, card_ids, retained, request_key) if target == "legend" else None
+    if result is None:
+        return jsonify({"error": "هدف Fusion نامعتبر است", "error_code": "invalid_target"}), 400
+    if not result.success:
+        return jsonify({"error": result.error, "error_code": result.error_code or "fusion_failed"}), 409
+    return jsonify({
+        "ok": True, "message": "Fusion با موفقیت انجام شد", "replayed": result.replayed,
+        "profile": _player_hub().get_overview(g.user_id),
+        "data": {
+            "card": card_to_dict(result.upgraded_card),
+            "consumed_cards": [card_to_dict(card) for card in result.consumed_cards if card.card_id != retained],
+            "xp_gained": result.xp_gained,
+            "level_up": result.new_level > result.old_level,
+        },
+    })
+
+
+# ==================== Routes: Quick PvP ====================
+
+def _v2_economy():
+    from systems.progression_economy import ProgressionEconomy
+    return ProgressionEconomy(db)
+
+
+def _economy_response(result):
+    if result.get('ok'):
+        result['profile'] = _player_hub().get_overview(g.user_id)
+    return jsonify(result), 200 if result.get('ok') else 409
+
+
+@app.route('/api/v1/economy', methods=['GET'])
+@require_auth
+def economy_inventory():
+    return _economy_response(_v2_economy().inventory(g.user_id))
+
+
+@app.route('/api/v1/economy/claim/silver', methods=['POST'])
+@require_auth
+def silver_claim():
+    data = request.get_json(silent=True) or {}
+    if not data.get('request_key'):
+        return jsonify({'error':'request_key_required'}), 400
+    return _economy_response(_v2_economy().claim(g.user_id, 'silver', data['request_key']))
+
+
+@app.route('/api/v1/economy/quote', methods=['POST'])
+@require_auth
+def economy_quote():
+    data = request.get_json(silent=True) or {}
+    return _economy_response(_v2_economy().quote(g.user_id, str(data.get('item',''))))
+
+
+@app.route('/api/v1/economy/purchase', methods=['POST'])
+@require_auth
+def economy_purchase():
+    data = request.get_json(silent=True) or {}
+    return _economy_response(_v2_economy().purchase(g.user_id, str(data.get('quote_id',''))))
+
+
+@app.route('/api/v1/economy/cards/<card_id>/sell/preview', methods=['POST'])
+@require_auth
+def economy_sell_preview(card_id):
+    data = request.get_json(silent=True) or {}
+    return _economy_response(_v2_economy().sell_preview(g.user_id, card_id, str(data.get('rarity',''))))
+
+
+@app.route('/api/v1/economy/cards/<card_id>/sell', methods=['POST'])
+@require_auth
+def economy_sell(card_id):
+    data = request.get_json(silent=True) or {}
+    return _economy_response(_v2_economy().sell(g.user_id, card_id, str(data.get('rarity','')), data.get('request_key'), data.get('config_version')))
+
+
+@app.route('/api/v1/economy/cards/<card_id>/upgrade', methods=['POST'])
+@require_auth
+def economy_upgrade(card_id):
+    data = request.get_json(silent=True) or {}
+    return _economy_response(_v2_economy().upgrade(g.user_id, card_id, str(data.get('target','')), data.get('request_key'), data.get('config_version')))
+
+@app.route("/api/v1/quick/matchmaking", methods=["POST"])
+@require_auth
+def quick_matchmaking():
+    gate_error = _mode_access_error("quick", g.user_id)
+    if gate_error:
+        return gate_error
+    data = request.get_json(silent=True) or {}
+    variant = data.get("variant", "normal")
+    if variant not in QUICK_VARIANTS:
+        return jsonify({"error": "نوع Quick نامعتبر است", "reason": "invalid_variant"}), 400
+    try:status, game_request = quick_modes.matchmake_random(g.user_id, "quick", variant)
+    except ValueError as exc:return _quick_error(str(exc),409)
+    snapshot = _quick_snapshot(game_request, g.user_id)
+    snapshot["matchmaking_status"] = status
+    return jsonify(snapshot), 200 if status == "matched" else 201
+
+
+@app.route("/api/v1/quick/invites", methods=["POST"])
+@require_auth
+def quick_create_invite():
+    gate_error = _mode_access_error("quick", g.user_id)
+    if gate_error:
+        return gate_error
+    data = request.get_json(silent=True) or {}
+    variant = data.get("variant", "normal")
+    if variant not in QUICK_VARIANTS:
+        return jsonify({"error": "نوع Quick نامعتبر است", "reason": "invalid_variant"}), 400
+    try:game_request = quick_modes.create_invite(g.user_id, "quick", variant)
+    except ValueError as exc:return _quick_error(str(exc),409)
+    snapshot = _quick_snapshot(game_request, g.user_id)
+    snapshot.update({
+        "invite_token": game_request["invite_token"],
+        "invite_url": f"{request.host_url.rstrip('/')}?invite={game_request['invite_token']}",
+    })
+    return jsonify(snapshot), 201
+
+
+@app.route('/api/v1/quick/invites/<token>', methods=['GET'])
+@require_auth
+def quick_invite_info(token):
+    invite = quick_modes.get_request_by_token(token)
+    if not invite or invite['mode'] != 'quick' or invite['source'] != 'invite_link':
+        return _quick_error('not_found', 404)
+    return jsonify(variant=invite['variant'], expires_at=invite['expires_at'], status=invite['status'])
+
+
+@app.route("/api/v1/quick/invites/<token>/accept", methods=["POST"])
+@require_auth
+def quick_accept_invite(token: str):
+    invite = quick_modes.get_request_by_token(token)
+    if not invite or invite["mode"] != "quick" or invite["source"] != "invite_link":
+        return _quick_error("not_found", 404)
+    ok, reason, game_request = quick_modes.accept_invite(token, g.user_id)
+    if not ok:
+        return _quick_error(reason, 404 if reason == "not_found" else 409)
+    return jsonify(_quick_snapshot(game_request, g.user_id))
+
+
+@app.route("/api/v1/quick/requests/<request_id>", methods=["GET"])
+@require_auth
+def quick_request_status(request_id: str):
+    game_request = _quick_request_for_user(request_id, g.user_id)
+    if not game_request:
+        return _quick_error("not_found", 404)
+    return jsonify(_quick_snapshot(game_request, g.user_id))
+
+
+@app.route("/api/v1/quick/requests/<request_id>/cancel", methods=["POST"])
+@require_auth
+def quick_cancel_request(request_id: str):
+    game_request = _quick_request_for_user(request_id, g.user_id)
+    if not game_request:
+        return _quick_error("not_found", 404)
+    if not quick_modes.cancel_request(request_id, g.user_id):
+        return jsonify({"error": "این درخواست دیگر قابل لغو نیست", "reason": game_request["status"]}), 409
+    return jsonify(_quick_snapshot(quick_modes.get_request(request_id), g.user_id))
+
+
+def _quick_active_request(request_id: str):
+    game_request = _quick_request_for_user(request_id, g.user_id)
+    if not game_request:
+        return None, _quick_error("not_found", 404)
+    if game_request["status"] not in ("accepted", "active", "completed"):
+        return None, (
+            jsonify({"error": "مسابقه هنوز شروع نشده", "reason": game_request["status"]}),
+            409,
+        )
+    return game_request, None
+
+
+@app.route("/api/v1/quick/matches/<request_id>", methods=["GET"])
+@require_auth
+def quick_match_state(request_id: str):
+    game_request, error = _quick_active_request(request_id)
+    if error:
+        return error
+    return jsonify(_quick_snapshot(game_request, g.user_id))
+
+
+@app.route("/api/v1/quick/matches/<request_id>/card", methods=["POST"])
+@require_auth
+def quick_choose_card(request_id: str):
+    game_request, error = _quick_active_request(request_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    if not data.get("card_id"):
+        return jsonify({"error": "card_id الزامی است", "reason": "missing_card_id"}), 400
+    _quick_snapshot(game_request, g.user_id)
+    try:
+        quick_modes.select_quick_card(request_id, g.user_id, str(data["card_id"]))
+    except ValueError as exc:
+        return _quick_error(str(exc), 409 if str(exc) == "choice_locked" else 400)
+    return jsonify(_quick_snapshot(quick_modes.get_request(request_id), g.user_id))
+
+
+@app.route("/api/v1/quick/matches/<request_id>/ability", methods=["POST"])
+@require_auth
+def quick_choose_ability(request_id: str):
+    game_request, error = _quick_active_request(request_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    ability_key = str(data.get("ability_key", ""))
+    if not ability_key:
+        return jsonify({"error": "ability_key الزامی است", "reason": "missing_ability_key"}), 400
+    try:
+        quick_modes.select_quick_ability(request_id, g.user_id, ability_key)
+    except ValueError as exc:
+        return _quick_error(str(exc), 409 if str(exc) == "choice_locked" else 400)
+    return jsonify(_quick_snapshot(quick_modes.get_request(request_id), g.user_id))
+
+
+@app.route("/api/v1/quick/matches/<request_id>/stat", methods=["POST"])
+@require_auth
+def quick_choose_stat(request_id: str):
+    game_request, error = _quick_active_request(request_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    stat = str(data.get("stat", ""))
+    if not stat:
+        return jsonify({"error": "stat الزامی است", "reason": "missing_stat"}), 400
+    try:
+        quick_modes.select_quick_stat(request_id, g.user_id, stat)
+    except ValueError as exc:
+        return _quick_error(str(exc), 409 if str(exc) == "choice_locked" else 400)
+    return jsonify(_quick_snapshot(quick_modes.get_request(request_id), g.user_id))
+
+
+# ==================== Routes: Mini App three-round PvP ====================
+
+def _three_request_for_user(request_id: str, user_id: int):
+    game_request = quick_modes.get_request(request_id)
+    if not game_request or game_request["mode"] != MINI_THREE_ROUND_MODE:
+        return None
+    game_request = _expire_waiting_request(game_request)
+    participants = {game_request.get("creator_id"), game_request.get("opponent_id")}
+    return game_request if user_id in participants else None
+
+
+def _three_snapshot(game_request: dict, user_id: int) -> dict:
+    snapshot = mini_three_round.snapshot(game_request, user_id)
+    own_id = snapshot.pop("my_card_id", None)
+    opponent_id = snapshot.pop("opponent_card_id", None)
+    own_card = db.get_card_by_id_for_player(own_id, user_id) if own_id else None
+    rival_card = db.get_card_by_id_for_player(opponent_id, snapshot["opponent_id"]) if opponent_id else None
+    snapshot["my_card"] = card_to_dict(own_card) if own_card else None
+    snapshot["opponent_card"] = card_to_dict(rival_card) if rival_card else None
+    return snapshot
+
+
+@app.route("/api/v1/three-round/matchmaking", methods=["POST"])
+@require_auth
+def three_matchmaking():
+    gate_error = _mode_access_error(MINI_THREE_ROUND_MODE, g.user_id)
+    if gate_error:
+        return gate_error
+    status, game_request = quick_modes.matchmake_random(g.user_id, MINI_THREE_ROUND_MODE, "normal")
+    snapshot = _three_snapshot(game_request, g.user_id)
+    snapshot["matchmaking_status"] = status
+    return jsonify(snapshot), 200 if status == "matched" else 201
+
+
+@app.route("/api/v1/three-round/invites", methods=["POST"])
+@require_auth
+def three_create_invite():
+    gate_error = _mode_access_error(MINI_THREE_ROUND_MODE, g.user_id)
+    if gate_error:
+        return gate_error
+    game_request = quick_modes.create_invite(g.user_id, MINI_THREE_ROUND_MODE, "normal")
+    snapshot = _three_snapshot(game_request, g.user_id)
+    snapshot.update({
+        "invite_token": game_request["invite_token"],
+        "invite_url": f"{request.host_url.rstrip('/')}?three_invite={game_request['invite_token']}",
+    })
+    return jsonify(snapshot), 201
+
+
+@app.route("/api/v1/three-round/invites/<token>/accept", methods=["POST"])
+@require_auth
+def three_accept_invite(token: str):
+    invite = quick_modes.get_request_by_token(token)
+    if not invite or invite["mode"] != MINI_THREE_ROUND_MODE or invite["source"] != "invite_link":
+        return _quick_error("not_found", 404)
+    ok, reason, game_request = quick_modes.accept_invite(token, g.user_id)
+    if not ok:
+        return _quick_error(reason, 404 if reason == "not_found" else 409)
+    return jsonify(_three_snapshot(game_request, g.user_id))
+
+
+@app.route("/api/v1/three-round/requests/<request_id>", methods=["GET"])
+@require_auth
+def three_request_status(request_id: str):
+    game_request = _three_request_for_user(request_id, g.user_id)
+    if not game_request:
+        return _quick_error("not_found", 404)
+    return jsonify(_three_snapshot(game_request, g.user_id))
+
+
+@app.route("/api/v1/three-round/requests/<request_id>/cancel", methods=["POST"])
+@require_auth
+def three_cancel_request(request_id: str):
+    game_request = _three_request_for_user(request_id, g.user_id)
+    if not game_request:
+        return _quick_error("not_found", 404)
+    if not quick_modes.cancel_request(request_id, g.user_id):
+        return _quick_error("match_not_ready", 409)
+    return jsonify(_three_snapshot(quick_modes.get_request(request_id), g.user_id))
+
+
+def _three_active_request(request_id: str):
+    game_request = _three_request_for_user(request_id, g.user_id)
+    if not game_request:
+        return None, _quick_error("not_found", 404)
+    if game_request["status"] not in ("accepted", "active"):
+        return None, _quick_error("match_not_ready", 409)
+    _three_snapshot(game_request, g.user_id)
+    return quick_modes.get_request(request_id), None
+
+
+@app.route("/api/v1/three-round/matches/<request_id>/card", methods=["POST"])
+@require_auth
+def three_choose_card(request_id: str):
+    game_request, error = _three_active_request(request_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    if not data.get("card_id"):
+        return _quick_error("missing_card_id", 400)
+    try:
+        mini_three_round.choose_card(request_id, g.user_id, str(data["card_id"]))
+    except ValueError as exc:
+        return _quick_error(str(exc), 409)
+    return jsonify(_three_snapshot(quick_modes.get_request(request_id), g.user_id))
+
+
+@app.route("/api/v1/three-round/matches/<request_id>/stat", methods=["POST"])
+@require_auth
+def three_choose_stat(request_id: str):
+    game_request, error = _three_active_request(request_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    if not data.get("stat"):
+        return _quick_error("missing_stat", 400)
+    try:
+        mini_three_round.choose_stat(request_id, g.user_id, str(data["stat"]))
+    except ValueError as exc:
+        return _quick_error(str(exc), 409)
+    return jsonify(_three_snapshot(quick_modes.get_request(request_id), g.user_id))
+
+
+@app.route("/api/v1/three-round/matches/<request_id>/ability", methods=["POST"])
+@require_auth
+def three_choose_ability(request_id: str):
+    game_request, error = _three_active_request(request_id)
+    if error:
+        return error
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get('ability_key'), str) or not data['ability_key']:
+        return _quick_error('unknown_ability', 400)
+    try:
+        mini_three_round.choose_ability(request_id, g.user_id, data['ability_key'], data.get('round'))
+    except ValueError as exc:
+        reason = str(exc)
+        return _quick_error(reason, 400 if reason in {'invalid_round', 'unknown_ability', 'ability_not_supported'} else 409)
+    return jsonify(_three_snapshot(quick_modes.get_request(request_id), g.user_id))
+
+
+# ==================== Routes: Solo Fight ====================
+
+def _solo_snapshot(fight, user_id):
+    """Player-scoped ASO view; ability use lives in existing persistent JSON."""
+    arena = json.loads(fight.get('arena_snapshot') or '{}')
+    used = arena.pop(SOLO_ABILITY_FIELD, None)
+    from systems.custom_cards import match_card
+    player_card = match_card(db,'solo:'+fight['fight_id'],user_id,fight['player_card_id'])
+    revealed = fight['status'] == 'completed' or (used and used['ability_key'] == 'reveal_opponent')
+    ai_card = db.get_card_by_id(fight['ai_card_id']) if revealed else None
+    aso = AsoAI(fight['difficulty'])
+    enabled = arena.get('abilities_enabled', True)
+    stats = json.loads(fight['player_current_stats'])
+    boosts = {stat: battle_system.calculate_boost(player_card, fight['arena'], stat, arena or None)
+              for stat in ('power', 'speed', 'iq', 'popularity')} if player_card else {}
+    used_stats = json.loads(fight['player_used_stats'] or '[]')
+    return {
+        'fight_id': fight['fight_id'], 'status': fight['status'],
+        'player_card': card_to_dict(player_card) if player_card else None,
+        'ai_card': card_to_dict(ai_card) if ai_card else None,
+        'ai_name': aso.mode['name'], 'aso_dialog': aso.get_greeting(),
+        'arena': arena, 'current_round': fight['current_round'],
+        'available_stats': [stat for stat in ('power', 'speed', 'iq', 'popularity') if stat not in used_stats],
+        'my_values': {stat: value + boosts.get(stat, 0) for stat, value in stats.items()},
+        'my_boosts': boosts, 'my_ability_used': bool(used), 'my_ability': used,
+        'abilities_enabled': enabled,
+        'abilities': available_abilities(quick_modes, user_id)
+            if not used and enabled and fight['status'] == 'in_progress' else [],
+    }
+
+
+@app.route('/api/v1/solo/fights/<fight_id>', methods=['GET'])
+@require_auth
+def solo_fight_status(fight_id):
+    fight = db.get_solo_fight(fight_id)
+    if not fight or fight['player_id'] != g.user_id:
+        return _quick_error('not_found', 404)
+    return jsonify(_solo_snapshot(fight, g.user_id))
+
+
+@app.route('/api/v1/solo/ability', methods=['POST'])
+@require_auth
+def solo_ability():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or not isinstance(data.get('fight_id'), str):
+        return _quick_error('not_found', 400)
+    if not isinstance(data.get('ability_key'), str):
+        return _quick_error('unknown_ability', 400)
+    try:
+        with closing(sqlite3.connect(db.db_path, timeout=15)) as conn, conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('SELECT * FROM solo_fights WHERE fight_id=?', (data['fight_id'],)).fetchone()
+            if not row or row['player_id'] != g.user_id:
+                return _quick_error('not_found', 404)
+            fight = dict(row)
+            if fight['status'] != 'in_progress':
+                raise ValueError('match_not_ready')
+            if type(data.get('round')) is not int or not 1 <= data['round'] <= 3:
+                raise ValueError('invalid_round')
+            if data['round'] != fight['current_round']:
+                raise ValueError('round_changed')
+            arena = json.loads(fight.get('arena_snapshot') or '{}')
+            if arena.get(SOLO_ABILITY_FIELD):
+                raise ValueError('ability_already_used')
+            if not arena.get('abilities_enabled', True):
+                raise ValueError('abilities_disabled')
+            definition = ability_definition(data['ability_key'])
+            effect = definition['effect']
+            event = {'ability_key': data['ability_key'], 'round': fight['current_round'],
+                     'title': definition['title']}
+            if effect['type'] == 'reroll_arena':
+                arena = select_arena(arena_registry, fight['arena'],
+                                     allow_fallback=arena.get('version') is None)
+                event.update(previous_arena=fight['arena'], arena=arena['arena_id'])
+                fight['arena'] = arena['arena_id']
+                fight['arena_version'] = arena.get('version')
+            elif effect['type'] == 'weaken_stat':
+                current = json.loads(fight['ai_current_stats'])
+                stat = effect['stat']
+                before = current[stat]
+                current[stat] = max(0, before + int(effect['delta']))
+                fight['ai_current_stats'] = json.dumps(current)
+                event.update(stat=stat, delta=current[stat]-before)
+            arena[SOLO_ABILITY_FIELD] = event
+            fight['arena_snapshot'] = json.dumps(arena, ensure_ascii=False)
+            consume_ability(conn, g.user_id, data['ability_key'])
+            conn.execute('''UPDATE solo_fights SET arena=?, arena_version=?, arena_snapshot=?,
+                ai_current_stats=? WHERE fight_id=?''',
+                (fight['arena'], fight.get('arena_version'), fight['arena_snapshot'],
+                 fight['ai_current_stats'], fight['fight_id']))
+            return jsonify(_solo_snapshot(fight, g.user_id))
+    except ValueError as exc:
+        reason = str(exc)
+        return _quick_error(reason, 400 if reason in {'invalid_round', 'unknown_ability', 'ability_not_supported'} else 409)
+
+@app.route("/api/v1/solo/daily-limit", methods=["GET"])
+@require_auth
+def get_daily_limit():
+    user_id = g.user_id
+    used = db.get_daily_solo_count(user_id)
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+    return jsonify({
+        "used": used,
+        "limit": DAILY_SOLO_LIMIT,
+        "remaining": max(0, DAILY_SOLO_LIMIT - used),
+        "resets_at": tomorrow,
+    })
+
+
+@app.route("/api/v1/solo/start", methods=["POST"])
+@require_auth
+def solo_start():
+    """شروع یک Solo fight جدید"""
+    user_id = g.user_id
+    data = request.get_json() or {}
+    player_card_id = data.get("player_card_id")
+    difficulty = data.get("difficulty", "medium")
+
+    if difficulty not in ("easy", "medium", "hard"):
+        return jsonify({"error": "سختی نامعتبر است"}), 400
+
+    used = db.get_daily_solo_count(user_id)
+    if used >= DAILY_SOLO_LIMIT:
+        return jsonify({"error": f"امروز {DAILY_SOLO_LIMIT} بار بازی کردی. فردا دوباره بیا."}), 429
+
+    player = db.get_or_create_player(user_id)
+    if player.hearts <= 0:
+        return jsonify({"error": "قلب نداری! از شاپ بخر."}), 400
+
+    if not player_card_id:
+        return jsonify({"error": "کارت انتخاب‌شده معتبر نیست"}), 400
+
+    player_card = db.get_card_by_id_for_player(player_card_id, user_id)
+    if not player_card:
+        raw = db.get_card_by_id(player_card_id)
+        if raw and raw.origin == "custom":
+            return jsonify({"error": "این کارت در این مود مجاز نیست", "code": "card_ineligible"}), 400
+        return jsonify({"error": "کارت انتخاب‌شده معتبر نیست"}), 400
+    from systems.shared_foundation import eligible_cards
+    if not eligible_cards(db, [player_card], "practice"):
+        return jsonify({"error": "این کارت در این مود مجاز نیست", "code": "card_ineligible"}), 400
+
+    player_cards = db.get_player_cards(user_id)
+    player_card_ids = [c.card_id for c in player_cards]
+    if player_card_id not in player_card_ids:
+        return jsonify({"error": "این کارت مال تو نیست"}), 403
+
+    aso = AsoAI(difficulty)
+    ai_card = aso.select_card(db)
+    if not ai_card:
+        return jsonify({"error": "کارت AI پیدا نشد"}), 500
+
+    # Solo has no manual arena picker, so it chooses from the published Mini App
+    # pool and records its immutable version immediately.
+    arena_info = arena_registry.select_for_match("three_round", "miniapp")
+    if not arena_info:
+        fallback_enabled = os.getenv("ARENA_REGISTRY_FALLBACK_SEED", "1").strip().casefold() not in {"0", "false", "off", "no"}
+        if not fallback_enabled:
+            logger.error("solo_start_blocked_empty_arena_pool mode=three_round platform=miniapp")
+            return jsonify({"error": "فعلاً زمین فعالی برای بازی وجود ندارد؛ کمی بعد دوباره تلاش کنید.", "code": "arena_pool_empty"}), 503
+        logger.warning("arena_registry_static_fallback mode=three_round platform=miniapp")
+        arena_id = random.choice(list(ARENAS.keys()))
+        arena_info = ARENAS[arena_id]
+        arena_snapshot = {"arena_id": arena_id, "version": None, "mode": "three_round", **arena_info}
+    else:
+        arena_id = arena_info["arena_id"]
+        logger.info("arena_selected arena=%s mode=three_round platform=miniapp", arena_id)
+        arena_snapshot = arena_registry.snapshot_for_match(arena_id, "three_round", "miniapp", arena_info["version"])
+
+    try:
+        fight_id = db.create_solo_fight(user_id, difficulty, player_card_id=player_card_id)
+    except ValueError:
+        return jsonify({"error": "این کارت دیگر قابل استفاده نیست", "code": "card_ineligible"}), 409
+    from systems.custom_cards import match_card
+    player_card = match_card(db, 'solo:' + fight_id, user_id, player_card_id)
+    db.update_solo_fight(
+        fight_id,
+        player_card_id=player_card_id,
+        ai_card_id=ai_card.card_id,
+        arena=arena_id,
+        arena_version=arena_snapshot.get("version"),
+        arena_snapshot=json.dumps(arena_snapshot, ensure_ascii=False),
+        status="in_progress",
+        player_current_stats=json.dumps({
+            "power": player_card.power,
+            "speed": player_card.speed,
+            "iq": player_card.iq,
+            "popularity": player_card.popularity,
+        }),
+        ai_current_stats=json.dumps({
+            "power": ai_card.power,
+            "speed": ai_card.speed,
+            "iq": ai_card.iq,
+            "popularity": ai_card.popularity,
+        }),
+    )
+
+    return jsonify(_solo_snapshot(db.get_solo_fight(fight_id), user_id))
+
+
+@app.route("/api/v1/solo/round", methods=["POST"])
+@require_auth
+def solo_round():
+    """بازی یک راوند"""
+    user_id = g.user_id
+    data = request.get_json() or {}
+    fight_id = data.get("fight_id")
+    player_stat = data.get("player_stat")
+
+    if not fight_id or not player_stat:
+        return jsonify({"error": "fight_id و player_stat الزامی است"}), 400
+
+    # One transaction owns the round, rewards and history across processes.
+    with closing(sqlite3.connect(db.db_path, timeout=15)) as conn:
+        conn.row_factory = sqlite3.Row
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return _play_solo_round(conn, user_id, fight_id, player_stat)
+
+
+def _play_solo_round(conn, user_id, fight_id, player_stat):
+    row = conn.execute("SELECT * FROM solo_fights WHERE fight_id=?", (fight_id,)).fetchone()
+    fight = dict(row) if row else None
+    if not fight or fight["player_id"] != user_id:
+        return jsonify({"error": "Fight پیدا نشد"}), 404
+
+    if fight["status"] != "in_progress":
+        return jsonify({"error": "این fight تموم شده"}), 400
+
+    daily = conn.execute("SELECT count FROM daily_solo_count WHERE user_id=? AND date=?",
+                         (user_id, datetime.now().strftime("%Y-%m-%d"))).fetchone()
+    if daily and daily[0] >= DAILY_SOLO_LIMIT:
+        return jsonify({"error": "سهمیه بازی امروز تمام شده است"}), 429
+
+    player = conn.execute("SELECT hearts FROM players WHERE user_id=?", (user_id,)).fetchone()
+    if not player or player["hearts"] <= 0:
+        return jsonify({"error": "برای ادامه نبرد قلب کافی نداری"}), 400
+
+    player_used = json.loads(fight["player_used_stats"] or "[]")
+    ai_used = json.loads(fight["ai_used_stats"] or "[]")
+    available_stats = [s for s in ["power", "speed", "iq", "popularity"] if s not in player_used]
+
+    if player_stat not in available_stats:
+        return jsonify({"error": "این stat قبلاً استفاده شده"}), 400
+
+    from systems.custom_cards import match_card
+    player_card = match_card(db,"solo:"+fight["fight_id"],user_id,fight["player_card_id"])
+    ai_card = db.get_card_by_id(fight["ai_card_id"])
+    if not player_card or not ai_card:
+        return jsonify({"error": "کارت این نبرد دیگر در دسترس نیست"}), 409
+
+    aso = AsoAI(fight["difficulty"])
+    ai_available = [s for s in ["power", "speed", "iq", "popularity"] if s not in ai_used]
+    ai_stat = aso.select_stat(ai_available, ai_card, player_card, fight["current_round"])
+
+    player_current = json.loads(fight["player_current_stats"])
+    ai_current = json.loads(fight["ai_current_stats"])
+
+    player_base = player_current[player_stat]
+    ai_base = ai_current[ai_stat]
+
+    # محاسبه boost از arena
+    arena_id = fight["arena"]
+    arena_snapshot = json.loads(fight.get("arena_snapshot") or "{}")
+    player_boost = battle_system.calculate_boost(player_card, arena_id, player_stat, arena_snapshot or None)
+    ai_boost = battle_system.calculate_boost(ai_card, arena_id, ai_stat, arena_snapshot or None)
+
+    player_total = player_base + player_boost
+    ai_total = ai_base + ai_boost
+
+    # تعیین برنده راوند
+    if player_total > ai_total:
+        round_winner = "player"
+        win_margin = player_total - ai_total
+        reduction = 2 if win_margin >= 5 else 1
+        ai_current[ai_stat] = max(0, ai_current[ai_stat] - reduction)
+    elif ai_total > player_total:
+        round_winner = "ai"
+        win_margin = ai_total - player_total
+        reduction = 2 if win_margin >= 5 else 1
+        player_current[player_stat] = max(0, player_current[player_stat] - reduction)
+    else:
+        round_winner = "tie"
+
+    player_rounds_won = fight["player_rounds_won"] + (1 if round_winner == "player" else 0)
+    ai_rounds_won = fight["ai_rounds_won"] + (1 if round_winner == "ai" else 0)
+    current_round = fight["current_round"] + 1
+
+    player_used.append(player_stat)
+    ai_used.append(ai_stat)
+
+    rounds_history = json.loads(fight["rounds_history"] or "[]")
+    rounds_history.append({
+        "round": fight["current_round"],
+        "player_stat": player_stat,
+        "player_total": player_total,
+        "ai_stat": ai_stat,
+        "ai_total": ai_total,
+        "winner": round_winner,
+        "arena": {key: value for key, value in arena_snapshot.items() if key != SOLO_ABILITY_FIELD},
+        "ability": arena_snapshot.get(SOLO_ABILITY_FIELD)
+            if arena_snapshot.get(SOLO_ABILITY_FIELD, {}).get('round') == fight['current_round'] else None,
+    })
+
+    # بازی تموم میشه وقتی یکی ۲ راوند برنده بشه یا ۳ راوند بگذره
+    game_over = player_rounds_won >= 2 or ai_rounds_won >= 2 or current_round > 3
+
+    aso_dialog = aso.get_round_dialog(round_winner == "ai")
+
+    update_data = {
+        "player_rounds_won": player_rounds_won,
+        "ai_rounds_won": ai_rounds_won,
+        "current_round": current_round,
+        "player_used_stats": json.dumps(player_used),
+        "ai_used_stats": json.dumps(ai_used),
+        "player_current_stats": json.dumps(player_current),
+        "ai_current_stats": json.dumps(ai_current),
+        "rounds_history": json.dumps(rounds_history),
+    }
+    if game_over:
+        update_data["status"] = "completed"
+        update_data["completed_at"] = datetime.now().isoformat()
+
+    fields = ", ".join(f"{key}=?" for key in update_data)
+    conn.execute(f"UPDATE solo_fights SET {fields} WHERE fight_id=?", (*update_data.values(), fight_id))
+
+    remaining_stats = [s for s in ["power", "speed", "iq", "popularity"] if s not in player_used]
+
+    response = {
+        "round_number": fight["current_round"],
+        "player_stat": player_stat,
+        "player_value": player_base,
+        "player_boost": player_boost,
+        "player_total": player_total,
+        "ai_stat": ai_stat,
+        "ai_value": ai_base,
+        "ai_boost": ai_boost,
+        "ai_total": ai_total,
+        "round_winner": round_winner,
+        "player_rounds_won": player_rounds_won,
+        "ai_rounds_won": ai_rounds_won,
+        "game_over": game_over,
+        "next_round": current_round,
+        "used_stats": {"player": player_used, "ai": ai_used},
+        "available_stats": remaining_stats,
+        "aso_dialog": aso_dialog,
+    }
+
+    if game_over:
+        # در تساوی، بررسی می‌کنیم کی بیشتر راوند برده
+        if player_rounds_won > ai_rounds_won:
+            winner = "player"
+        elif ai_rounds_won > player_rounds_won:
+            winner = "ai"
+        else:
+            winner = "tie"
+        rewards = _finalize_solo_fight(user_id, fight_id, winner, aso, player_card, ai_card, conn)
+        response["final_result"] = {
+            "winner": winner,
+            "aso_dialog": aso.get_result_dialog(winner == "ai"),
+            "rewards": rewards,
+            "rounds_detail": rounds_history,
+        }
+
+    fight.update(update_data)
+    response['fight'] = _solo_snapshot(fight, user_id)
+    return jsonify(response)
+
+
+def _finalize_solo_fight(user_id, fight_id, winner, aso: AsoAI, player_card, ai_card, conn) -> dict:
+    """Apply the result and daily count on the transaction that completed this fight."""
+    from systems.match_rewards_system import MatchRewardsSystem
+
+    player = conn.execute("SELECT hearts FROM players WHERE user_id=?", (user_id,)).fetchone()
+    if winner == "player":
+        award = aso.calculate_rewards()
+        score, xp, tp, hearts_lost = award["score"], award["xp"], award["tier_points"], 0
+        result = "win"
+    elif winner == "ai":
+        penalty = aso.calculate_defeat_penalty()
+        score, xp, tp = 0, penalty["xp"], -5
+        hearts_lost = min(player["hearts"], penalty["hearts_lost"])
+        result = "loss"
+    else:
+        score, xp, tp, hearts_lost, result = 0, 2, 0, 0, "tie"
+
+    conn.execute("INSERT OR IGNORE INTO player_progression(user_id) VALUES(?)", (user_id,))
+    old = conn.execute(
+        "SELECT level,tier_points,current_tier FROM player_progression WHERE user_id=?", (user_id,)
+    ).fetchone()
+    paid = MatchRewardsSystem.award(conn, f"solo:{fight_id}", "solo", {user_id: {
+        "result": result, "xp": xp, "score": score,
+        "hearts_lost": hearts_lost, "tp_delta": tp,
+        "card_id": player_card.card_id, "opponent_card_id": ai_card.card_id,
+        "opponent_id": None,
+    }})
+    xp, score, hearts_lost = paid[str(user_id)]["xp"], paid[str(user_id)]["score"], paid[str(user_id)].get("hearts_lost", hearts_lost)
+    new = conn.execute(
+        "SELECT level,tier_points,current_tier FROM player_progression WHERE user_id=?", (user_id,)
+    ).fetchone()
+    now = datetime.now()
+    conn.execute(
+        """INSERT INTO daily_solo_count(user_id,date,count) VALUES (?,?,1)
+           ON CONFLICT(user_id,date) DO UPDATE SET count=count+1""",
+        (user_id, now.strftime("%Y-%m-%d")),
+    )
+    rewards = {
+        "score_gained": score, "xp_gained": xp,
+        "tier_points_change": new["tier_points"] - old["tier_points"],
+        "hearts_lost": hearts_lost,
+        "level_up": new["level"] > old["level"],
+        "new_level": new["level"] if new["level"] > old["level"] else None,
+        "tier_change": new["current_tier"] if new["current_tier"] != old["current_tier"] else None,
+    }
+    if winner == "ai":
+        rewards["hearts_remaining"] = player["hearts"] - hearts_lost
+    return rewards
+
+
+@app.route("/api/v1/solo/result/<fight_id>", methods=["GET"])
+@require_auth
+def solo_result(fight_id):
+    """دریافت نتیجه نهایی یک fight تموم‌شده"""
+    user_id = g.user_id
+    fight = db.get_solo_fight(fight_id)
+    if not fight or fight["player_id"] != user_id:
+        return jsonify({"error": "Fight پیدا نشد"}), 404
+
+    player = db.get_or_create_player(user_id)
+    return jsonify({
+        "fight_id": fight_id,
+        "status": fight["status"],
+        "player_rounds_won": fight["player_rounds_won"],
+        "ai_rounds_won": fight["ai_rounds_won"],
+        "rounds_detail": json.loads(fight["rounds_history"] or "[]"),
+        "player_after": {
+            "hearts": player.hearts,
+            "total_score": player.total_score,
+        }
+    })
+
+
+# ==================== Routes: Leaderboard ====================
+
+@app.route("/api/v1/leaderboard", methods=["GET"])
+@require_auth
+def get_leaderboard():
+    period = request.args.get("period", "weekly")
+    limit = min(int(request.args.get("limit", 50)), 100)
+    from systems.progression_config import enabled
+    if enabled(db):
+        if period not in ('daily','weekly','monthly','all'):
+            return jsonify({'error':'invalid_period'}), 400
+        from systems.progression_leaderboard import ProgressionLeaderboard
+        entries = ProgressionLeaderboard(db).view(period, limit)
+        mine = next((item for item in entries if item['user_id'] == g.user_id), None)
+        return jsonify({'period':period,'my_rank':mine['rank'] if mine else None,'my_score':mine['period_score'] if mine else 0,
+            'entries':[{**item,'score':item['period_score']} for item in entries]})
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT user_id, username, first_name, total_score
+        FROM players
+        ORDER BY total_score DESC
+        LIMIT ?
+    ''', (limit,))
+    rows = cursor.fetchall()
+
+    user_id = g.user_id
+    my_rank = None
+    my_score = None
+    cursor.execute(
+        'SELECT COUNT(*)+1 FROM players WHERE total_score > (SELECT total_score FROM players WHERE user_id = ?)',
+        (user_id,)
+    )
+    rank_row = cursor.fetchone()
+    if rank_row:
+        my_rank = rank_row[0]
+    cursor.execute('SELECT total_score FROM players WHERE user_id = ?', (user_id,))
+    score_row = cursor.fetchone()
+    if score_row:
+        my_score = score_row[0]
+
+    conn.close()
+
+    entries = []
+    for i, row in enumerate(rows):
+        entries.append({
+            "rank": i + 1,
+            "user_id": row["user_id"],
+            "username": row["username"] or "",
+            "first_name": row["first_name"] or "",
+            "score": row["total_score"],
+        })
+
+    return jsonify({
+        "period": period,
+        "my_rank": my_rank,
+        "my_score": my_score,
+        "entries": entries,
+    })
+
+
+# ==================== اجرا ====================
+
+def run_miniapp_server(host="0.0.0.0", port=5001, debug=False):
+    debug_mode = debug or os.environ.get("FLASK_DEBUG", "0") == "1"
+    # use_reloader=False چون در thread اجرا میشه
+    app.run(host=host, port=port, debug=debug_mode, use_reloader=False)
+
+
+if __name__ == "__main__":
+    run_miniapp_server(debug=True)

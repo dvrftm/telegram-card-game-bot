@@ -1,0 +1,261 @@
+"""Transactional card upgrades shared by the bot and Mini App."""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
+
+from systems.economy_system import EconomySystem
+from systems.phase2_systems import LevelSystem
+from systems.card_action_requests import lookup_in, record_in
+
+
+logger = logging.getLogger(__name__)
+
+
+class CardUpgradeSystem:
+    UPGRADES = {
+        "normal_to_epic": {"source": "normal", "target": "epic", "price_key": "upgrade_normal_to_epic", "xp": 15},
+        "epic_to_legend": {"source": "epic", "target": "legend", "price_key": "upgrade_epic_to_legend", "xp": 30},
+    }
+
+    def __init__(self, db):
+        self.db = db
+
+    @staticmethod
+    def _active_match(conn: sqlite3.Connection, user_id: int) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1 FROM active_fights
+            WHERE (challenger_id=? OR opponent_id=?)
+              AND status NOT IN ('completed', 'cancelled', 'expired')
+            LIMIT 1
+            """,
+            (user_id, user_id),
+        ).fetchone()
+        if row:
+            return True
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM solo_fights WHERE player_id=? AND status!='completed' LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if row:
+                return True
+        except sqlite3.OperationalError:
+            pass
+        try:
+            rows = conn.execute(
+                """
+                SELECT r.mode, r.status, r.expires_at, s.state_json,
+                       r.creator_id, r.opponent_id
+                FROM game_requests r
+                LEFT JOIN game_match_states s ON s.request_id=r.request_id
+                WHERE (r.creator_id=? OR r.opponent_id=? OR r.mode='easy')
+                  AND r.status IN ('accepted', 'active')
+                """,
+                (user_id, user_id),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        for mode, status, expires_at, state_json, creator_id, opponent_id in rows:
+            try:
+                state = json.loads(state_json or "{}")
+                if not isinstance(state, dict):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            # Easy stores joined participants in its state, not opponent_id.
+            if user_id not in (creator_id, opponent_id) and user_id not in state.get("players", []):
+                continue
+            if state.get("phase") in ("completed", "finished", "cancelled", "expired"):
+                continue
+            if status == "accepted":
+                # Deck matches live in active_fights; their accepted request
+                # is not advanced when the fight finishes.
+                if mode == "deck":
+                    continue
+                deadline = expires_at
+            else:
+                deadline = state.get("deadline")
+            try:
+                if not deadline:
+                    continue
+                expires = datetime.fromisoformat(str(deadline))
+                if expires.tzinfo is not None:
+                    expires = expires.astimezone(timezone.utc).replace(tzinfo=None)
+                if expires > now:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def is_management_locked(self, user_id: int) -> bool:
+        conn = sqlite3.connect(self.db.db_path)
+        try:
+            return self._active_match(conn, user_id)
+        finally:
+            conn.close()
+
+    def preview(self, user_id: int, card_id: str) -> Dict[str, Any]:
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            return {"ok": False, "error_code": "coin_upgrade_removed", "error": "ارتقا با نسخه‌های یکسان انجام می‌شود"}
+        conn = sqlite3.connect(self.db.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                """
+                SELECT c.name, COALESCE(pc.rarity_override, c.rarity) AS rarity,
+                       p.coins
+                FROM player_cards pc
+                JOIN cards c ON c.card_id=pc.card_id
+                JOIN players p ON p.user_id=pc.user_id
+                WHERE pc.user_id=? AND pc.card_id=? AND c.origin='official'
+                """,
+                (user_id, card_id),
+            ).fetchone()
+            if not row:
+                return {"ok": False, "error_code": "card_not_owned", "error": "کارت در کلکسیون شما نیست"}
+            upgrade_key = next((key for key, value in self.UPGRADES.items() if value["source"] == row["rarity"]), None)
+            if not upgrade_key:
+                return {"ok": False, "error_code": "not_upgradeable", "error": "این کارت قابلیت ارتقای بیشتر ندارد"}
+            rule = self.UPGRADES[upgrade_key]
+            variant = conn.execute(
+                "SELECT 1 FROM card_variants WHERE card_id=? AND rarity=?",
+                (card_id, rule["target"]),
+            ).fetchone()
+            if not variant:
+                return {"ok": False, "error_code": "variant_unavailable", "error": "نسخه ارتقایافته این کارت هنوز آماده نیست"}
+            price = EconomySystem.PRICES[rule["price_key"]]
+            return {
+                "ok": True,
+                "upgrade_key": upgrade_key,
+                "card_id": card_id,
+                "card_name": row["name"],
+                "from_rarity": rule["source"],
+                "to_rarity": rule["target"],
+                "price": price,
+                "xp": rule["xp"],
+                "coins": int(row["coins"] or 0),
+                "can_afford": int(row["coins"] or 0) >= price,
+                "blocked_by_match": self._active_match(conn, user_id),
+            }
+        finally:
+            conn.close()
+
+    def upgrade(self, user_id: int, card_id: str, upgrade_key: str,
+                request_key: Optional[str] = None) -> Dict[str, Any]:
+        from systems.progression_config import enabled
+        if enabled(self.db):
+            return {"ok": False, "error_code": "coin_upgrade_removed", "error": "ارتقای سکه‌ای حذف شده است"}
+        rule = self.UPGRADES.get(upgrade_key)
+        if not rule:
+            return {"ok": False, "error_code": "invalid_upgrade", "error": "نوع ارتقا نامعتبر است"}
+        price = EconomySystem.PRICES[rule["price_key"]]
+        conn = sqlite3.connect(self.db.db_path, timeout=15)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("BEGIN IMMEDIATE")
+            receipt = lookup_in(conn, user_id, request_key, "coin_upgrade",
+                                {"card_id": card_id, "upgrade_key": upgrade_key})
+            if receipt is not None:
+                conn.commit()
+                return {**receipt, "replayed": True}
+            if self._active_match(conn, user_id):
+                conn.rollback()
+                return {"ok": False, "error_code": "active_match", "error": "تا پایان مسابقه نمی‌توانی کارت را ارتقا بدهی"}
+            row = conn.execute(
+                """
+                SELECT pc.id, c.name, COALESCE(pc.rarity_override, c.rarity) AS rarity,
+                       p.coins
+                FROM player_cards pc
+                JOIN cards c ON c.card_id=pc.card_id
+                JOIN players p ON p.user_id=pc.user_id
+                WHERE pc.user_id=? AND pc.card_id=? AND c.origin='official'
+                """,
+                (user_id, card_id),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return {"ok": False, "error_code": "card_not_owned", "error": "کارت در کلکسیون شما نیست"}
+            if row["rarity"] != rule["source"]:
+                conn.rollback()
+                return {"ok": False, "error_code": "rarity_changed", "error": "وضعیت کارت تغییر کرده؛ صفحه را تازه کن"}
+            if not conn.execute(
+                "SELECT 1 FROM card_variants WHERE card_id=? AND rarity=?",
+                (card_id, rule["target"]),
+            ).fetchone():
+                conn.rollback()
+                return {"ok": False, "error_code": "variant_unavailable", "error": "نسخه ارتقایافته این کارت هنوز آماده نیست"}
+            if int(row["coins"] or 0) < price:
+                conn.rollback()
+                return {"ok": False, "error_code": "insufficient_coins", "error": "سکه کافی نیست"}
+
+            coin_update = conn.execute(
+                "UPDATE players SET coins=coins-? WHERE user_id=? AND coins>=?",
+                (price, user_id, price),
+            )
+            if coin_update.rowcount != 1:
+                conn.rollback()
+                return {"ok": False, "error_code": "insufficient_coins", "error": "سکه کافی نیست"}
+            from systems.card_inventory_system import CardInventorySystem
+            if not CardInventorySystem.consume_in(conn, user_id, card_id, rule["source"]):
+                raise RuntimeError("card upgrade race detected")
+            CardInventorySystem.grant_in(conn, user_id, card_id, rule["target"])
+            CardInventorySystem.reconcile_active_in(conn, user_id, card_id)
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO player_progression
+                    (user_id, level, total_xp, tier_points, current_tier, last_played_at)
+                VALUES (?, 1, 0, 0, 'Bronze', CURRENT_TIMESTAMP)
+                """,
+                (user_id,),
+            )
+            progression = conn.execute(
+                "SELECT level, total_xp FROM player_progression WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            old_level = int(progression["level"] or 1)
+            total_xp = int(progression["total_xp"] or 0) + int(rule["xp"])
+            new_level = LevelSystem.get_level_from_xp(total_xp)
+            conn.execute(
+                "UPDATE player_progression SET total_xp=?, level=? WHERE user_id=?",
+                (total_xp, new_level, user_id),
+            )
+            from systems.level_rewards_system import LevelRewardsSystem
+            LevelRewardsSystem.grant_crossed_in(conn, user_id, old_level, new_level)
+            final_coins = conn.execute(
+                "SELECT coins FROM players WHERE user_id=?", (user_id,)
+            ).fetchone()[0]
+            result = {
+                "ok": True,
+                "card_id": card_id,
+                "card_name": row["name"],
+                "from_rarity": rule["source"],
+                "to_rarity": rule["target"],
+                "price": price,
+                "xp_gained": rule["xp"],
+                "old_level": old_level,
+                "new_level": new_level,
+                "coins": int(final_coins),
+            }
+            record_in(conn, user_id, request_key, "coin_upgrade",
+                      {"card_id": card_id, "upgrade_key": upgrade_key}, result)
+            conn.commit()
+            return result
+        except ValueError as exc:
+            conn.rollback()
+            return {"ok": False, "error_code": "idempotency_conflict", "error": str(exc)}
+        except Exception:
+            conn.rollback()
+            logger.exception("Transactional card upgrade failed")
+            return {"ok": False, "error_code": "upgrade_failed", "error": "ارتقای کارت انجام نشد"}
+        finally:
+            conn.close()

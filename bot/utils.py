@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Bot Utility Functions - توابع کمکی ربات
+"""
+
+import json
+import os
+import logging
+import random
+from typing import Optional, List, Dict
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+
+logger = logging.getLogger(__name__)
+
+# Required channel for bot usage
+REQUIRED_CHANNEL = '@KhasteNews'
+
+# Panel expiration timeout (15 minutes)
+PANEL_TIMEOUT = 15 * 60
+
+
+async def check_user_started_bot(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """بررسی اینکه آیا کاربر ربات را استارت کرده یا نه"""
+    try:
+        await context.bot.send_chat_action(chat_id=user_id, action="typing")
+        return True
+    except Exception:
+        return False
+
+
+async def handle_user_not_started(query, context: ContextTypes.DEFAULT_TYPE):
+    """مدیریت حالتی که کاربر ربات را استارت نکرده"""
+    user_name = query.from_user.first_name or query.from_user.username or "کاربر"
+    text = (
+        f"🤖 **{user_name}** برای شرکت در بازی باید ابتدا ربات را استارت کند!\n\n"
+        f"👆 روی دکمه زیر کلیک کنید و /start بزنید:"
+    )
+    keyboard = [[InlineKeyboardButton("🚀 استارت ربات", url="https://t.me/TelBattleBot?start=pvp")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    except Exception:
+        pass
+
+    await query.answer(
+        "🤖 ابتدا باید ربات را در پیام خصوصی استارت کنید!",
+        show_alert=True
+    )
+
+
+def ensure_text_content(text: str, fallback: str = "📱 پیام بدون محتوا") -> str:
+    """اطمینان از وجود محتوای متنی برای تلگرام"""
+    if not text or text.strip() == "":
+        return fallback
+    return text.strip()
+
+
+def get_card_image_path(card_name: str, config: Dict) -> Optional[str]:
+    """دریافت مسیر تصویر کارت"""
+    if not config.get('image_settings', {}).get('enable_images', False):
+        return None
+
+    images_path = config.get('image_settings', {}).get('card_images_path', 'assets/card_images/')
+    default_image = config.get('image_settings', {}).get('default_card_image', 'assets/card_images/default.png')
+
+    # اگه path مطلق نبود، relative به working dir
+    if not os.path.isabs(images_path):
+        images_path = os.path.join(os.getcwd(), images_path)
+    if not os.path.isabs(default_image):
+        default_image = os.path.join(os.getcwd(), default_image)
+
+    # fallback: اگه path اصلی خالی بود، assets/card_images رو امتحان کن
+    if not os.path.exists(images_path) or not os.listdir(images_path):
+        fallback = os.path.join(os.getcwd(), 'assets', 'card_images')
+        if os.path.exists(fallback) and os.listdir(fallback):
+            images_path = fallback
+
+    os.makedirs(images_path, exist_ok=True)
+
+    # تبدیل اسم کارت به نام فایل
+    card_filename = card_name.lower().replace(' ', '_').replace('-', '_')
+    possible_extensions = ['.png', '.jpg', '.jpeg', '.webp']
+
+    for ext in possible_extensions:
+        card_image = os.path.join(images_path, f"{card_filename}{ext}")
+        if os.path.exists(card_image):
+            return card_image
+
+    # اگه با underscore پیدا نشد، با نقطه‌ها هم امتحان کن (مثل mr.krabs)
+    card_filename_dots = card_name.lower().replace(' ', '_')
+    for ext in possible_extensions:
+        card_image = os.path.join(images_path, f"{card_filename_dots}{ext}")
+        if os.path.exists(card_image):
+            return card_image
+
+    # اگه هنوز پیدا نشد، نقطه رو نگه دار (مثلاً mr.krabs.png)
+    card_filename_keep_dot = card_name.lower().replace(' ', '')
+    for ext in possible_extensions:
+        card_image = os.path.join(images_path, f"{card_filename_keep_dot}{ext}")
+        if os.path.exists(card_image):
+            return card_image
+
+    if os.path.exists(default_image):
+        return default_image
+
+    return None
+
+
+def get_victory_dialog(card_name: str, card_dialogs=None) -> str:
+    """Gets a random victory dialog for a card."""
+    if isinstance(card_dialogs, str) and card_dialogs.strip():
+        try:
+            card_dialogs = json.loads(card_dialogs)
+        except json.JSONDecodeError:
+            card_dialogs = [card_dialogs]
+    if isinstance(card_dialogs, list):
+        lines = [str(line).strip() for line in card_dialogs if str(line).strip()]
+        if lines:
+            return random.choice(lines)
+
+    try:
+        from core.card_content import content_for_card, load_card_content
+
+        entry = content_for_card(card_name, load_card_content())
+        if entry:
+            lines = entry.get("victory_lines", [])
+            if isinstance(lines, str):
+                lines = [lines]
+            if isinstance(lines, list):
+                usable_lines = [str(line).strip() for line in lines if str(line).strip()]
+                if usable_lines:
+                    return random.choice(usable_lines)
+    except Exception:
+        pass
+
+    generic = [
+        "Another victory!",
+        "No one can defeat me!",
+        "This was just the beginning!",
+        "True power is here!"
+    ]
+    return random.choice(generic)
+
+
+async def send_card_image_safely(message, card_name: str, config: Dict, caption: str = None, match_id: str = None, dialog_text: str = None) -> bool:
+    """ارسال امن تصویر کارت"""
+    try:
+        image_path = get_card_image_path(card_name, config)
+        if not image_path or not os.path.exists(image_path):
+            return False
+
+        if image_path.lower().endswith('.webp'):
+            with open(image_path, 'rb') as sticker:
+                await message.reply_sticker(sticker)
+        else:
+            with open(image_path, 'rb') as photo:
+                await message.reply_photo(photo, caption=caption, parse_mode='Markdown')
+
+        return True
+    except Exception as e:
+        logger.error(f"Error sending card image for {card_name}: {e}")
+        return False
+
+
+def ensure_not_expired(query, db=None, context=None) -> bool:
+    """بررسی منقضی نشدن پنل"""
+    import time
+    try:
+        msg_date = query.message.date
+        if msg_date:
+            import datetime as dt
+            now = dt.datetime.now(dt.timezone.utc)
+            if hasattr(msg_date, 'timestamp'):
+                age = now.timestamp() - msg_date.timestamp()
+            else:
+                age = 0
+            if age > PANEL_TIMEOUT:
+                return False
+    except Exception:
+        pass
+    return True

@@ -1,0 +1,15 @@
+# Generated graph artifacts and assistant/tool metadata
+graphify-out/
+.codex/
+.agents/
+.kiro/
+.github/
+design-system/
+.deploy-staging-*/
+telbattle-deploy-*.tar.gz
+
+# Non-runtime, archived, and binary-heavy content
+_inactive/
+assets/
+card_images/
+docs/

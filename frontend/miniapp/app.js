@@ -1,0 +1,268 @@
+// miniapp/app.js — router ساده
+
+const state = {
+  screen: "mode_select",
+  profile: null,
+  selectedDifficulty: null,
+  selectedCardId: null,
+  selectedCard: null,
+  currentFight: null,
+  lastFightResult: null,
+  cards: [],
+  leaderboard: null,
+  loading: false,
+  error: null,
+  roundResult: null,
+};
+
+function navigate(screen, data = {}) {
+  Object.assign(state, data);
+  state.screen = screen;
+  render();
+}
+
+function render() {
+  const app = document.getElementById("app");
+  switch (state.screen) {
+    case "mode_select":   app.innerHTML = renderModeSelect(state); break;
+    case "aso_select":    app.innerHTML = renderAsoSelect(state); break;
+    case "card_select":   app.innerHTML = renderCardSelect(state); break;
+    case "battle":        app.innerHTML = renderBattle(state); break;
+    case "result":        app.innerHTML = renderResult(state); break;
+    case "profile":       app.innerHTML = renderProfile(state); break;
+    case "leaderboard":   app.innerHTML = renderLeaderboard(state); break;
+    default:              app.innerHTML = renderModeSelect(state);
+  }
+  bindEvents();
+}
+
+function bindEvents() {
+  // event delegation روی document — یه بار bind میشه
+  document.removeEventListener("click", handleAction);
+  document.addEventListener("click", handleAction);
+}
+
+async function handleAction(e) {
+  // از bubble استفاده کن تا closest data-action رو پیدا کنه
+  const el = e.target.closest("[data-action]");
+  if (!el) return;
+  if (el.dataset.action === "") return;
+
+  const action = el.dataset.action;
+  const value = el.dataset.value;
+
+  switch (action) {
+    case "go_aso_select":
+      navigate("aso_select");
+      break;
+
+    case "select_difficulty":
+      navigate("card_select", { selectedDifficulty: value });
+      await loadCards();
+      break;
+
+    case "select_card": {
+      const card = state.cards.find(c => c.card_id === value);
+      state.selectedCardId = value;
+      state.selectedCard = card || null;
+      render(); // re-render to show selection highlight + bottom sheet
+      break;
+    }
+
+    case "confirm_card":
+      if (!state.selectedCardId) return;
+      navigate("battle", {});
+      await startFight();
+      break;
+
+    case "select_stat":
+      if (!state.currentFight || !state.currentFight.fight_id) {
+        showError("ابتدا باید نبرد شروع شود");
+        return;
+      }
+      await playRound(value);
+      break;
+
+    case "go_home":
+      navigate("mode_select");
+      break;
+
+    case "play_again":
+      navigate("aso_select");
+      break;
+
+    case "go_profile":
+      navigate("profile", { profile: state.profile });
+      loadProfile();
+      break;
+
+    case "go_leaderboard":
+      navigate("leaderboard");
+      loadLeaderboard();
+      break;
+
+    case "dismiss_round":
+      // handled by playRound's own listener
+      break;
+
+    case "filter_rarity":
+      await loadCards(value);
+      break;
+
+    case "filter_leaderboard":
+      await loadLeaderboard(value);
+      break;
+  }
+}
+
+async function startFight() {
+  try {
+    state.loading = true;
+    render();
+    const fight = await API.soloStart(state.selectedCardId, state.selectedDifficulty);
+    state.currentFight = fight;
+  } catch (err) {
+    showError(err.message);
+    navigate("card_select");
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+async function playRound(stat) {
+  if (state.loading) {
+    console.warn("playRound blocked: loading=true");
+    return;
+  }
+  state.loading = true;
+  render(); // فیدبک فوری: دکمه‌ها در حین درخواست disabled شوند تا دابل‌کلیک نشود
+
+  try {
+    console.log("playRound calling API:", state.currentFight.fight_id, stat);
+    const result = await API.soloRound(state.currentFight.fight_id, stat);
+    console.log("playRound result:", result);
+    state.currentFight = { ...state.currentFight, ...result };
+    state.loading = false;
+
+    // نمایش نتیجه راوند قبل از رفتن به مرحله بعد
+    state.roundResult = result;
+    render();
+
+    // صبر تا کاربر overlay رو ببنده (با کلیک یا بعد از ۳ ثانیه)
+    await new Promise(resolve => {
+      const timeout = setTimeout(() => { resolve(); }, 3000);
+      const handler = (e) => {
+        if (e.target.closest("[data-action='dismiss_round']")) {
+          clearTimeout(timeout);
+          document.removeEventListener("click", handler);
+          resolve();
+        }
+      };
+      document.addEventListener("click", handler);
+      // اگه timeout زودتر تموم شد
+      setTimeout(() => { document.removeEventListener("click", handler); }, 3100);
+    });
+
+    state.roundResult = null;
+
+    if (result.game_over) {
+      navigate("result", { lastFightResult: result.final_result });
+    } else {
+      render();
+    }
+  } catch (err) {
+    console.error("playRound error:", err);
+    state.loading = false;
+    showError(err.message);
+    render();
+  }
+}
+
+async function loadCards(rarity = "all") {
+  state.loading = true;
+  render();
+  try {
+    const data = await API.getCards(rarity);
+    state.cards = data.cards;
+    state.selectedCard = null;
+    state.selectedCardId = null;
+  } catch (err) {
+    console.warn("loadCards error:", err.message);
+    state.cards = [];
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+async function loadProfile() {
+  try {
+    const data = await API.getProfile();
+    state.profile = data;
+    render();
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+async function loadLeaderboard(period = "weekly") {
+  try {
+    const data = await API.getLeaderboard(period);
+    state.leaderboard = data;
+    render();
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+function showLoading(screen) {
+  state.loading = true;
+  const app = document.getElementById("app");
+  app.innerHTML = `
+    <div class="min-h-screen flex items-center justify-center">
+      <div class="text-center">
+        <div class="font-headline-lg text-headline-lg text-primary italic mb-4">TelBattle</div>
+        <div class="text-on-surface-variant font-body-md">در حال بارگذاری...</div>
+      </div>
+    </div>`;
+}
+
+function showError(msg) {
+  console.error("APP ERROR:", msg);
+  const tg = window.Telegram?.WebApp;
+  if (tg?.showPopup) {
+    tg.showPopup({title: "خطا", message: msg, buttons: [{type: "ok"}]});
+  } else if (tg?.showAlert) {
+    tg.showAlert(msg);
+  } else {
+    // نمایش روی صفحه برای debug
+    const errDiv = document.createElement("div");
+    errDiv.style.cssText = "position:fixed;top:0;left:0;right:0;padding:16px;background:red;color:white;z-index:99999;font-size:14px;direction:ltr;";
+    errDiv.textContent = "ERROR: " + msg;
+    document.body.appendChild(errDiv);
+    setTimeout(() => errDiv.remove(), 5000);
+  }
+}
+
+// شروع اپ
+async function initApp() {
+  const tg = window.Telegram?.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+  }
+
+  // بارگذاری پروفایل در پس‌زمینه — اگه خطا داد مشکلی نیست
+  try {
+    state.profile = await API.getProfile();
+  } catch (e) {
+    console.warn("Profile load failed:", e.message);
+  }
+
+  // navigate صفحه رو render می‌کنه و loading رو جایگزین می‌کنه
+  navigate("mode_select");
+}
+
+// اجرای فوری — script‌ها بدون defer لود میشن
+initApp();
