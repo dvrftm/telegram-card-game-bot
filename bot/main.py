@@ -409,20 +409,7 @@ class TelegramCardBot(
     # ==================== CHANNEL MEMBERSHIP CHECK ====================
 
     async def is_user_in_channel(self, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """بررسی عضویت کاربر در کانال الزامی"""
-        try:
-            if not REQUIRED_CHANNEL:
-                return True
-            member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-            if member.status in ["member", "administrator", "creator"]:
-                return True
-            return False
-        except telegram.error.BadRequest as e:
-            logger.error(f"Error checking membership for user {user_id}: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error checking channel membership: {e}")
-            return False
+        return True
     
     async def send_channel_join_message(self, update: Update) -> None:
         """ارسال پیام درخواست عضویت در کانال"""
